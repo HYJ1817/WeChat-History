@@ -279,7 +279,7 @@ MIT 要求在任何副本或实质部分中保留版权声明与许可声明。�
 - DeskBox `LICENSE` 为 GPLv3 全文；`LICENSING.md` 为 GPL-3.0-only + 商业双轨。
 - 本项目 `src/` 中没有网络客户端、SQLite、frida、微信路径或数据库/密钥代码；
   worker 只导入标准库与 vendored 模块。
-- NuGet/Python 包版本与许可证来自 `NativeApp.csproj`、`project.assets.json`、
+- NuGet/Python 包版本与许可证来自 `WeChat-History.csproj`、`project.assets.json`、
   `.tools/packages/*.nuspec`、`.venv/.../dist-info/METADATA` 与包内许可证文件。
 - `artifacts/test-results/native-tests.trx` 记录第一阶段当时的 22/22 通过（本轮已扩充到 42/42）；
   `artifacts/native-flow/report.json`（Debug 版）、

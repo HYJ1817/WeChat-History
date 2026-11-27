@@ -31,6 +31,7 @@ public sealed partial class MainWindow : Window
         Vm = new MainViewModel(DispatcherQueue);
         InitializeComponent();
         Title = "微信记忆";
+        AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "app.ico"));
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(TitleBarDragRegion);
         ApplyTitleBarTheme();

@@ -1073,10 +1073,15 @@ def serve(stream_in: BinaryIO, stream_out: BinaryIO, demo_path: str,
     seen_requests: set[str] = set()
     context = Context(demo_path, jobs_dir, scenes_file, model_root)
     try:
+        first_request = True
         while True:
             line = stream_in.readline(MAX_REQUEST_BYTES + 1)
             if not line:
                 break
+            if first_request:
+                first_request = False
+                if line.startswith(b"\xef\xbb\xbf"):
+                    line = line[3:]
             if len(line) > MAX_REQUEST_BYTES and not line.endswith(b"\n"):
                 while True:
                     extra = stream_in.readline(MAX_REQUEST_BYTES + 1)

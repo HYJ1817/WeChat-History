@@ -19,7 +19,7 @@ public static class NativeFlowCapture {
 '@
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $scriptDir
-if (-not $Executable) { $Executable = Join-Path $root 'src/NativeApp/bin/x64/Debug/net10.0-windows10.0.19041.0/win-x64/NativeApp.exe' }
+if (-not $Executable) { $Executable = Join-Path $root 'src/NativeApp/bin/x64/Debug/net10.0-windows10.0.19041.0/win-x64/WeChat-History.exe' }
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $root 'artifacts/native-flow' }
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $evidenceCopy = Join-Path $OutputDirectory 'ui-export-2026-11-24.md'

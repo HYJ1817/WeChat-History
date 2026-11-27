@@ -111,6 +111,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(responses[1]["result"]["items"][0]["messageCount"], 12)
         self.assertTrue(responses[2]["result"]["shutdown"])
 
+    def test_utf8_bom_on_first_request_is_accepted(self):
+        raw = b"\xef\xbb\xbf" + json.dumps(request("bom", "hello")).encode("utf-8") + b"\n"
+        process = subprocess.run(
+            [sys.executable, "-I", "-X", "utf8", "-u", str(WORKER), "--demo", str(DEMO)],
+            input=raw, capture_output=True, timeout=30, cwd=str(ROOT))
+        self.assertEqual(process.returncode, 0)
+        response = json.loads(process.stdout.decode("utf-8"))
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["requestId"], "bom")
+
     def test_malformed_json_gets_one_error_with_null_id(self):
         raw = b"{not json}\n"
         process = subprocess.run(

@@ -1,7 +1,7 @@
 # 第三方组件与许可证声明
 
 > 核验日期：2026-11-27
-> 版本来源：`src/NativeApp/NativeApp.csproj`、`obj/project.assets.json`、
+> 版本来源：`src/NativeApp/WeChat-History.csproj`、`obj/project.assets.json`、
 > `.tools/packages/*.nuspec`、`.venv/.../dist-info/METADATA` 与包内许可证文件。
 > 本文件是工程记录，不构成法律意见；分发前请由权利人复核。
 
@@ -29,7 +29,7 @@
 - NuGet 包：`Microsoft.WindowsAppSDK.WinUI/2.7.0`；同时解析
   `Microsoft.WindowsAppSDK.Base/2.7.0`、`Microsoft.WindowsAppSDK.Foundation/2.7.0`、
   `Microsoft.WindowsAppSDK.InteractiveExperiences/2.7.0`。
-- 项目引用：`src/NativeApp/NativeApp.csproj`。
+- 项目引用：`src/NativeApp/WeChat-History.csproj`。
 - 许可证：包内 `license.txt` 为 **“MICROSOFT SOFTWARE LICENSE TERMS —
   MICROSOFT WINDOWS APP SDK”**，属于 Microsoft 的软件许可条款，不是 MIT 或
   OSI 开源许可证。条款允许按约定再分发随 NuGet 包 binplace 到应用中的可分发代码；

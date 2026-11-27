@@ -12,7 +12,7 @@ try {
     $workerDist = Join-Path $publishRoot 'worker-dist'
     $workerWork = Join-Path $publishRoot 'worker-build'
     $workerSpec = Join-Path $publishRoot 'worker-spec'
-    $project = Join-Path $ProjectRoot 'src/NativeApp/NativeApp.csproj'
+    $project = Join-Path $ProjectRoot 'src/NativeApp/WeChat-History.csproj'
 
     foreach ($dir in @($publishDir, $workerDist, $workerWork, $workerSpec)) {
         if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
@@ -29,16 +29,17 @@ try {
         '--self-contained', 'true', '-p:Platform=x64', '-o', $publishDir, '--nologo'
     )
 
-    $appExe = Join-Path $publishDir 'NativeApp.exe'
-    if (-not (Test-Path -LiteralPath $appExe)) { throw 'dotnet publish did not produce NativeApp.exe.' }
+    $appExe = Join-Path $publishDir 'WeChat-History.exe'
+    if (-not (Test-Path -LiteralPath $appExe)) { throw 'dotnet publish did not produce WeChat-History.exe.' }
 
-    $pyinstaller = Join-Path $ProjectRoot '.venv/Scripts/pyinstaller.exe'
-    if (-not (Test-Path -LiteralPath $pyinstaller)) { throw 'PyInstaller is not installed in the project venv.' }
     Write-Output 'Building the standalone worker with PyInstaller (onedir)...'
+    # Invoke PyInstaller through the project interpreter; this is more reliable
+    # than the generated pyinstaller.exe launcher in restricted Windows setups.
     # onedir avoids a 200+ MiB one-file extraction on every launch and is much
     # friendlier to antivirus software once frida and the speech stack are included.
-    Invoke-Checked $pyinstaller @(
-        '--noconfirm', '--clean', '--onedir',
+    Invoke-Checked $python @(
+        '-I', '-m', 'PyInstaller',
+        '--noconfirm', '--clean', '--onedir', '--log-level', 'WARN',
         '--name', 'WechatMemory.Worker',
         '--distpath', $workerDist,
         '--workpath', $workerWork,
