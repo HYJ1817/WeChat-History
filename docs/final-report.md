@@ -1,7 +1,7 @@
 # 最终实现与验证报告
 
 > 日期：2026-11-27
-> 范围：把原项目尚未迁移的真实微信读取、导出、媒体、语音、任务/场景/投递与原生界面补齐，并完成本机验证与便携发布。
+> 范围：把原项目尚未迁移的真实微信读取、导出、媒体、语音、任务/场景/投递与原生界面补齐，并完成本机验证、便携发布与当前用户安装包发布。
 > 说明：本报告只记录工程结果，不包含任何真实聊天内容、账户名、绝对数据路径或密钥。
 
 ## 1. 交付物与启动方式
@@ -15,15 +15,15 @@
 ├─ worker/
 │  ├─ WechatMemory.Worker.exe          PyInstaller onedir worker
 │  └─ _internal/                       Python、frida、ffmpeg、报告/语音依赖
-├─ README.md / THIRD_PARTY_NOTICES.md
+├─ README.md / LICENSE / BUILD-INFO.txt / THIRD_PARTY_NOTICES.md
 ├─ LICENSES/                           上游 MIT、CPython/PyInstaller、Python 包许可证
 ├─ docs/                               协议、评估、本报告
 └─ logs/                               首次运行后生成
 ```
 
-- 目录大小：**约 718.5 MiB（881 个文件）**，包含 README、许可证与 `docs/` 文档；
-  `publish-report.json` 保留在开发目录 `artifacts/publish` 中。`Publish.ps1` 本次统计为
-  881 个文件、约 753.4 MB（2026-11-27 缺陷修复后重新发布）；以资源管理器显示为准。
+- 目录大小：**约 718.5 MiB（883 个文件）**，包含 README、LICENSE、`BUILD-INFO.txt`、许可证与 `docs/` 文档；
+  Release 另提供约 193 MiB 的当前用户安装包。`publish-report.json` 保留在开发目录
+  `artifacts/publish` 中；以资源管理器显示为准。
 - 启动：在项目根目录双击 `微信记忆` 快捷方式，或直接运行
 
   ```powershell
@@ -35,7 +35,7 @@
 
 - 发布版**不包含演示数据**，启动后只检测本机微信账户；选择账户并确认后才连接。
 - 运行时不要求系统安装 .NET、Python 或 PyInstaller；需要 x64 Windows 10 build 19041+ / Windows 11 和交互式桌面。
-- 这是**便携文件夹，不是安装器**；分发时要复制整个文件夹，不能只发 `NativeApp.exe`。
+- 同时提供**便携文件夹**与**当前用户安装包**；便携分发时要复制整个文件夹，不能只发 `NativeApp.exe`。
 - 未签名 EXE 可能触发 SmartScreen 或杀毒软件提示；Frida 组件也可能被安全软件拦截。
 
 ### 源码运行
@@ -146,6 +146,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Run.ps1
 | C# 测试 | `.tools/dotnet/dotnet test tests/NativeApp.Tests/NativeApp.Tests.csproj -c Debug` | **42/42 通过**，约 2 秒；含新增场景/投递/媒体测试 18 个 |
 | UI 自动化（`--demo` 测试 fixture） | `scripts/Test-NativeFlow.ps1`（Debug） | 通过：3 个会话、筛选 4/4 条、导出 546 字节、自定义保存路径精确匹配、worker 回收、退出码 0。fixture 来自仓库，不进入发布包 |
 | 发布版 UI 端到端（测试 fixture） | 同上，`-Executable 微信记忆App/NativeApp.exe` | 通过：3 个会话、筛选 4/4 条、导出 546 字节、自定义保存路径精确匹配、实际 worker 为 `WechatMemory.Worker.exe`、回收成功、退出码 0（2026-11-27 缺陷修复后发布构建复跑） |
+| 当前用户安装包 | `WeChat-Memory-Setup-v0.1.0.exe /S /D=<临时目录>` | 通过：静默安装退出码 0；`NativeApp.exe`、`worker/WechatMemory.Worker.exe`、`Uninstall.exe`、`LICENSE` 存在；桌面/开始菜单快捷方式与卸载注册表创建；静默卸载退出码 0，目录、快捷方式和注册表清除 |
 | 发布版真实优先启动 | `artifacts/Probe-RealFirst.ps1 -Executable 微信记忆App/NativeApp.exe` | 通过：0 个会话（未连接）、发现 2 个账户、连接按钮可用、无 demo 开关；未重启微信 |
 | 演示任务/场景/语音 UI | `artifacts/Test-TaskFlow.ps1` | 通过：任务列表出现 1 条；场景下拉可展开；语音按钮可用 |
 | 打包 worker 协议 | `artifacts/packaged_protocol_smoke.py` | 通过：capabilities 15、JSON 12 条/3,703 字节、PDF 2 页/412,960 字节、场景 4、任务 delivered、账户 2、voice 组件可用、stderr 空、退出码 0 |
@@ -222,7 +223,7 @@ worker 回收、退出码 0）。本轮没有重新执行真实微信连接。
 
 ### 未完成（需要外部资产，不能仅靠代码）
 
-- **安装器**：没有 MSIX/Inno Setup/NSIS 打包；需要打包工具与安装权限。
+- **安装器**：已提供 NSIS 当前用户安装包（未签名，不需要管理员权限）；MSIX/带签名安装器未实现。
 - **代码签名**：没有证书，无法签 EXE/安装器；未签名会触发 SmartScreen/AV。
 - **自动更新**：需要更新服务器、签名与发布通道，未实现。
 - **崩溃上报/遥测**：按隐私要求默认不实现。
@@ -231,14 +232,14 @@ worker 回收、退出码 0）。本轮没有重新执行真实微信连接。
 
 当前构建适合**本机自用或懂技术的试用者**，不适合直接交给普通用户：
 
-- 未签名且无安装器；SmartScreen/杀毒软件可能拦截，Frida 组件尤其容易被拦截。
+- 未签名；安装器是当前用户级，SmartScreen/杀毒软件可能拦截，Frida 组件尤其容易被拦截。
 - 真实连接需要用户在微信窗口完成扫码/手机确认；无人值守测试已复现失败，不能承诺“一键连接”。
 - 只在本机微信 4.2.0.13 验证；其他 4.x 版本、数据库结构和多账户组合未验证。
-- 没有项目级 LICENSE；FFmpeg 的 GPL 分发风险未完成法律复核。
+- 项目已采用 MIT LICENSE；FFmpeg 的 GPL 分发风险未完成法律复核。
 - 未在干净 Windows VM、Windows 10 全版本、无 .NET 环境和多款杀毒软件上验收。
 - 没有自动更新、崩溃上报或远程支持通道。
 
-要把它变成“给别人用”的产品，至少还需要：代码签名与安装器、杀软白名单/兼容性测试、
+要把它变成“给别人用”的产品，至少还需要：安装器签名与代码签名、杀软白名单/兼容性测试、
 微信版本矩阵、清晰的人工登录引导与失败回退、许可证/隐私说明，以及更新通道。
 
 ### 已实现但未端到端验证
@@ -266,7 +267,7 @@ worker 回收、退出码 0）。本轮没有重新执行真实微信连接。
 ## 7. 后续建议
 
 1. 在干净 Windows 11/10 VM 上运行发布版，验证自包含运行时、杀软与 Frida。
-2. 明确项目整体许可证后，再对外分发；当前仓库没有项目级 LICENSE。
-3. 若要正式分发，补充安装器、代码签名、许可证文件收集与更新通道。
+2. 复核项目 MIT LICENSE 与第三方许可证（尤其 FFmpeg）后，再扩大对外分发。
+3. 若要正式分发，补充安装器签名、代码签名、许可证文件收集与更新通道。
 4. 若需要完整语音体验，提供模型下载镜像/离线导入，并在目标机器上跑一次真实转写回归。
 5. 若要支持更多微信版本，建立数据库 schema 探测与版本矩阵测试，而不是假设结构不变。
