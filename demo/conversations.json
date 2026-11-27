@@ -1,0 +1,1082 @@
+{
+  "version": 1,
+  "notice": "完全虚构的演示数据，与任何真实用户、聊天或数据库无关。",
+  "conversations": [
+    {
+      "id": "demo-chat-001",
+      "name": "演示 · 产品讨论（虚构）",
+      "kind": "group",
+      "messages": [
+        {
+          "id": "m001",
+          "sender": "林晓",
+          "timestamp": "2026-11-23T09:12:00+08:00",
+          "type": "text",
+          "content": "早上好 ☀️ 今天的议程：\n1. 原生客户端迁移\n2. 导出流程验收\n3. 风险清单",
+          "is_outgoing": false
+        },
+        {
+          "id": "m002",
+          "sender": "Chen Yu",
+          "timestamp": "2026-11-23T09:18:00+08:00",
+          "type": "text",
+          "content": "Morning! I reviewed the WinUI prototype. The layout is clear, but we still need real export verification.",
+          "is_outgoing": false
+        },
+        {
+          "id": "m003",
+          "sender": "林晓",
+          "timestamp": "2026-11-23T18:40:00+08:00",
+          "type": "image",
+          "content": "【图片占位】白板上的迁移里程碑草图；演示数据不包含图片文件，未做媒体解析。",
+          "is_outgoing": false
+        },
+        {
+          "id": "m004",
+          "sender": "阿宁",
+          "timestamp": "2026-11-23T19:05:00+08:00",
+          "type": "file",
+          "content": "【文件占位】demo-migration-plan.pdf；演示数据不包含实际文件。",
+          "is_outgoing": false
+        },
+        {
+          "id": "m005",
+          "sender": "Chen Yu",
+          "timestamp": "2026-11-24T00:00:00+08:00",
+          "type": "text",
+          "content": "边界测试：这条消息正好在 24 日 00:00（UTC+08:00）。",
+          "is_outgoing": false
+        },
+        {
+          "id": "m006",
+          "sender": "林晓",
+          "timestamp": "2026-11-24T09:30:00+08:00",
+          "type": "text",
+          "content": "日期筛选要以“包含所选日期”为准：\n开始日 00:00 包含，结束日次日 00:00 不包含。\n界面和导出必须一致 ✅",
+          "is_outgoing": false
+        },
+        {
+          "id": "m007",
+          "sender": "阿宁",
+          "timestamp": "2026-11-24T12:05:00+08:00",
+          "type": "voice",
+          "content": "【语音占位】约 12 秒；演示数据不包含音频，也未进行转写。",
+          "is_outgoing": false
+        },
+        {
+          "id": "m008",
+          "sender": "Chen Yu",
+          "timestamp": "2026-11-24T23:59:59+08:00",
+          "type": "text",
+          "content": "End-of-day check: inclusive end date works ✅",
+          "is_outgoing": false
+        },
+        {
+          "id": "m009",
+          "sender": "系统",
+          "timestamp": "2026-11-25T00:00:00+08:00",
+          "type": "system",
+          "content": "你已加入群聊「演示 · 产品讨论」。",
+          "is_outgoing": false
+        },
+        {
+          "id": "m010",
+          "sender": "林晓",
+          "timestamp": "2026-11-25T08:15:00+08:00",
+          "type": "text",
+          "content": "新的一天。中文、English 和 Emoji 😀 都应该在导出里原样保留。",
+          "is_outgoing": false
+        },
+        {
+          "id": "m011",
+          "sender": "阿宁",
+          "timestamp": "2026-11-25T10:42:00+08:00",
+          "type": "text",
+          "content": "多行消息示例：\n- 第一行\n- 第二行\n- 第三行",
+          "is_outgoing": false
+        },
+        {
+          "id": "m012",
+          "sender": "Chen Yu",
+          "timestamp": "2026-11-25T16:20:00+08:00",
+          "type": "text",
+          "content": "No real WeChat data, keys, or media are used anywhere in this demo.",
+          "is_outgoing": false
+        }
+      ]
+    },
+    {
+      "id": "demo-chat-002",
+      "name": "演示 · 迭代站会（虚构）",
+      "kind": "group",
+      "messages": [
+        {
+          "id": "s001",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T09:00:00+08:00",
+          "type": "text",
+          "content": "第 1 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s002",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T09:10:00+08:00",
+          "type": "text",
+          "content": "第 2 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s003",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T09:20:00+08:00",
+          "type": "text",
+          "content": "第 3 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s004",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T09:30:00+08:00",
+          "type": "text",
+          "content": "第 4 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s005",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T09:40:00+08:00",
+          "type": "text",
+          "content": "第 5 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s006",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T09:50:00+08:00",
+          "type": "text",
+          "content": "第 6 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s007",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T10:00:00+08:00",
+          "type": "text",
+          "content": "第 7 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s008",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T10:10:00+08:00",
+          "type": "text",
+          "content": "第 8 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s009",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T10:20:00+08:00",
+          "type": "text",
+          "content": "第 9 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s010",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T10:30:00+08:00",
+          "type": "text",
+          "content": "第 10 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s011",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T10:40:00+08:00",
+          "type": "text",
+          "content": "第 11 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s012",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T10:50:00+08:00",
+          "type": "text",
+          "content": "第 12 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s013",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T11:00:00+08:00",
+          "type": "text",
+          "content": "第 13 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s014",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T11:10:00+08:00",
+          "type": "text",
+          "content": "第 14 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s015",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T11:20:00+08:00",
+          "type": "text",
+          "content": "第 15 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s016",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T11:30:00+08:00",
+          "type": "text",
+          "content": "第 16 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s017",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T11:40:00+08:00",
+          "type": "text",
+          "content": "第 17 条：English note & emoji 🚀",
+          "is_outgoing": false
+        },
+        {
+          "id": "s018",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T11:50:00+08:00",
+          "type": "text",
+          "content": "第 18 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s019",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T12:00:00+08:00",
+          "type": "text",
+          "content": "第 19 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s020",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T12:10:00+08:00",
+          "type": "text",
+          "content": "第 20 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s021",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T12:20:00+08:00",
+          "type": "text",
+          "content": "第 21 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s022",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T12:30:00+08:00",
+          "type": "text",
+          "content": "第 22 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s023",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T12:40:00+08:00",
+          "type": "text",
+          "content": "第 23 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s024",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T12:50:00+08:00",
+          "type": "text",
+          "content": "第 24 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s025",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T13:00:00+08:00",
+          "type": "text",
+          "content": "第 25 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s026",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T13:10:00+08:00",
+          "type": "text",
+          "content": "第 26 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s027",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T13:20:00+08:00",
+          "type": "text",
+          "content": "第 27 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s028",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T13:30:00+08:00",
+          "type": "text",
+          "content": "第 28 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s029",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T13:40:00+08:00",
+          "type": "text",
+          "content": "第 29 条多行消息：\n第一行\n第二行",
+          "is_outgoing": false
+        },
+        {
+          "id": "s030",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T13:50:00+08:00",
+          "type": "text",
+          "content": "第 30 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s031",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T14:00:00+08:00",
+          "type": "text",
+          "content": "第 31 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s032",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T14:10:00+08:00",
+          "type": "text",
+          "content": "第 32 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s033",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T14:20:00+08:00",
+          "type": "text",
+          "content": "第 33 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s034",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T14:30:00+08:00",
+          "type": "text",
+          "content": "第 34 条：English note & emoji 🚀",
+          "is_outgoing": false
+        },
+        {
+          "id": "s035",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T14:40:00+08:00",
+          "type": "text",
+          "content": "第 35 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s036",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T14:50:00+08:00",
+          "type": "text",
+          "content": "第 36 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s037",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T15:00:00+08:00",
+          "type": "text",
+          "content": "第 37 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s038",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T15:10:00+08:00",
+          "type": "text",
+          "content": "第 38 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s039",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T15:20:00+08:00",
+          "type": "text",
+          "content": "第 39 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s040",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T15:30:00+08:00",
+          "type": "text",
+          "content": "第 40 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s041",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T15:40:00+08:00",
+          "type": "text",
+          "content": "第 41 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s042",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T15:50:00+08:00",
+          "type": "text",
+          "content": "第 42 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s043",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T16:00:00+08:00",
+          "type": "text",
+          "content": "第 43 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s044",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T16:10:00+08:00",
+          "type": "text",
+          "content": "第 44 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s045",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T16:20:00+08:00",
+          "type": "text",
+          "content": "第 45 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s046",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T16:30:00+08:00",
+          "type": "text",
+          "content": "第 46 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s047",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T16:40:00+08:00",
+          "type": "text",
+          "content": "第 47 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s048",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T16:50:00+08:00",
+          "type": "text",
+          "content": "第 48 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s049",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T17:00:00+08:00",
+          "type": "text",
+          "content": "第 49 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s050",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T17:10:00+08:00",
+          "type": "text",
+          "content": "第 50 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s051",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T17:20:00+08:00",
+          "type": "text",
+          "content": "第 51 条：English note & emoji 🚀",
+          "is_outgoing": false
+        },
+        {
+          "id": "s052",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T17:30:00+08:00",
+          "type": "text",
+          "content": "第 52 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s053",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T17:40:00+08:00",
+          "type": "text",
+          "content": "第 53 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s054",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T17:50:00+08:00",
+          "type": "text",
+          "content": "第 54 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s055",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T18:00:00+08:00",
+          "type": "text",
+          "content": "第 55 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s056",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T18:10:00+08:00",
+          "type": "text",
+          "content": "第 56 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s057",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T18:20:00+08:00",
+          "type": "text",
+          "content": "第 57 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s058",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T18:30:00+08:00",
+          "type": "text",
+          "content": "第 58 条多行消息：\n第一行\n第二行",
+          "is_outgoing": false
+        },
+        {
+          "id": "s059",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T18:40:00+08:00",
+          "type": "text",
+          "content": "第 59 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s060",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T18:50:00+08:00",
+          "type": "text",
+          "content": "第 60 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s061",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T19:00:00+08:00",
+          "type": "text",
+          "content": "第 61 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s062",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T19:10:00+08:00",
+          "type": "text",
+          "content": "第 62 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s063",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T19:20:00+08:00",
+          "type": "text",
+          "content": "第 63 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s064",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T19:30:00+08:00",
+          "type": "text",
+          "content": "第 64 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s065",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T19:40:00+08:00",
+          "type": "text",
+          "content": "第 65 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s066",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T19:50:00+08:00",
+          "type": "text",
+          "content": "第 66 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s067",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T20:00:00+08:00",
+          "type": "text",
+          "content": "第 67 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s068",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T20:10:00+08:00",
+          "type": "text",
+          "content": "第 68 条：English note & emoji 🚀",
+          "is_outgoing": false
+        },
+        {
+          "id": "s069",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T20:20:00+08:00",
+          "type": "text",
+          "content": "第 69 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s070",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T20:30:00+08:00",
+          "type": "text",
+          "content": "第 70 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s071",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T20:40:00+08:00",
+          "type": "text",
+          "content": "第 71 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s072",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T20:50:00+08:00",
+          "type": "text",
+          "content": "第 72 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s073",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T21:00:00+08:00",
+          "type": "text",
+          "content": "第 73 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s074",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T21:10:00+08:00",
+          "type": "text",
+          "content": "第 74 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s075",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T21:20:00+08:00",
+          "type": "text",
+          "content": "第 75 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s076",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T21:30:00+08:00",
+          "type": "text",
+          "content": "第 76 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s077",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T21:40:00+08:00",
+          "type": "text",
+          "content": "第 77 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s078",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T21:50:00+08:00",
+          "type": "text",
+          "content": "第 78 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s079",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T22:00:00+08:00",
+          "type": "text",
+          "content": "第 79 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s080",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T22:10:00+08:00",
+          "type": "text",
+          "content": "第 80 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s081",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T22:20:00+08:00",
+          "type": "text",
+          "content": "第 81 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s082",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T22:30:00+08:00",
+          "type": "text",
+          "content": "第 82 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s083",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T22:40:00+08:00",
+          "type": "text",
+          "content": "第 83 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s084",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T22:50:00+08:00",
+          "type": "text",
+          "content": "第 84 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s085",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T23:00:00+08:00",
+          "type": "text",
+          "content": "第 85 条：English note & emoji 🚀",
+          "is_outgoing": false
+        },
+        {
+          "id": "s086",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T23:10:00+08:00",
+          "type": "text",
+          "content": "第 86 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s087",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T23:20:00+08:00",
+          "type": "text",
+          "content": "第 87 条多行消息：\n第一行\n第二行",
+          "is_outgoing": false
+        },
+        {
+          "id": "s088",
+          "sender": "小雨",
+          "timestamp": "2026-11-20T23:30:00+08:00",
+          "type": "text",
+          "content": "第 88 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s089",
+          "sender": "Leo",
+          "timestamp": "2026-11-20T23:40:00+08:00",
+          "type": "text",
+          "content": "第 89 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s090",
+          "sender": "演示助手",
+          "timestamp": "2026-11-20T23:50:00+08:00",
+          "type": "text",
+          "content": "第 90 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s091",
+          "sender": "小雨",
+          "timestamp": "2026-11-21T00:00:00+08:00",
+          "type": "text",
+          "content": "第 91 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s092",
+          "sender": "Leo",
+          "timestamp": "2026-11-21T00:10:00+08:00",
+          "type": "text",
+          "content": "第 92 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s093",
+          "sender": "演示助手",
+          "timestamp": "2026-11-21T00:20:00+08:00",
+          "type": "text",
+          "content": "第 93 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s094",
+          "sender": "小雨",
+          "timestamp": "2026-11-21T00:30:00+08:00",
+          "type": "text",
+          "content": "第 94 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s095",
+          "sender": "Leo",
+          "timestamp": "2026-11-21T00:40:00+08:00",
+          "type": "text",
+          "content": "第 95 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s096",
+          "sender": "演示助手",
+          "timestamp": "2026-11-21T00:50:00+08:00",
+          "type": "text",
+          "content": "第 96 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s097",
+          "sender": "小雨",
+          "timestamp": "2026-11-21T01:00:00+08:00",
+          "type": "text",
+          "content": "第 97 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s098",
+          "sender": "Leo",
+          "timestamp": "2026-11-21T01:10:00+08:00",
+          "type": "text",
+          "content": "第 98 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s099",
+          "sender": "演示助手",
+          "timestamp": "2026-11-21T01:20:00+08:00",
+          "type": "text",
+          "content": "第 99 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s100",
+          "sender": "小雨",
+          "timestamp": "2026-11-21T01:30:00+08:00",
+          "type": "text",
+          "content": "第 100 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s101",
+          "sender": "Leo",
+          "timestamp": "2026-11-21T01:40:00+08:00",
+          "type": "text",
+          "content": "第 101 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s102",
+          "sender": "演示助手",
+          "timestamp": "2026-11-21T01:50:00+08:00",
+          "type": "text",
+          "content": "第 102 条：English note & emoji 🚀",
+          "is_outgoing": false
+        },
+        {
+          "id": "s103",
+          "sender": "小雨",
+          "timestamp": "2026-11-21T02:00:00+08:00",
+          "type": "text",
+          "content": "第 103 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s104",
+          "sender": "Leo",
+          "timestamp": "2026-11-21T02:10:00+08:00",
+          "type": "text",
+          "content": "第 104 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s105",
+          "sender": "演示助手",
+          "timestamp": "2026-11-21T02:20:00+08:00",
+          "type": "text",
+          "content": "第 105 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s106",
+          "sender": "小雨",
+          "timestamp": "2026-11-21T02:30:00+08:00",
+          "type": "text",
+          "content": "第 106 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s107",
+          "sender": "Leo",
+          "timestamp": "2026-11-21T02:40:00+08:00",
+          "type": "text",
+          "content": "第 107 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s108",
+          "sender": "演示助手",
+          "timestamp": "2026-11-21T02:50:00+08:00",
+          "type": "text",
+          "content": "第 108 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s109",
+          "sender": "小雨",
+          "timestamp": "2026-11-21T03:00:00+08:00",
+          "type": "text",
+          "content": "第 109 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s110",
+          "sender": "Leo",
+          "timestamp": "2026-11-21T03:10:00+08:00",
+          "type": "text",
+          "content": "第 110 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s111",
+          "sender": "演示助手",
+          "timestamp": "2026-11-21T03:20:00+08:00",
+          "type": "text",
+          "content": "第 111 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s112",
+          "sender": "小雨",
+          "timestamp": "2026-11-21T03:30:00+08:00",
+          "type": "text",
+          "content": "第 112 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s113",
+          "sender": "Leo",
+          "timestamp": "2026-11-21T03:40:00+08:00",
+          "type": "text",
+          "content": "第 113 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s114",
+          "sender": "演示助手",
+          "timestamp": "2026-11-21T03:50:00+08:00",
+          "type": "text",
+          "content": "第 114 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s115",
+          "sender": "小雨",
+          "timestamp": "2026-11-21T04:00:00+08:00",
+          "type": "text",
+          "content": "第 115 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s116",
+          "sender": "Leo",
+          "timestamp": "2026-11-21T04:10:00+08:00",
+          "type": "text",
+          "content": "第 116 条多行消息：\n第一行\n第二行",
+          "is_outgoing": false
+        },
+        {
+          "id": "s117",
+          "sender": "演示助手",
+          "timestamp": "2026-11-21T04:20:00+08:00",
+          "type": "text",
+          "content": "第 117 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s118",
+          "sender": "小雨",
+          "timestamp": "2026-11-21T04:30:00+08:00",
+          "type": "text",
+          "content": "第 118 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        },
+        {
+          "id": "s119",
+          "sender": "Leo",
+          "timestamp": "2026-11-21T04:40:00+08:00",
+          "type": "text",
+          "content": "第 119 条：English note & emoji 🚀",
+          "is_outgoing": false
+        },
+        {
+          "id": "s120",
+          "sender": "演示助手",
+          "timestamp": "2026-11-21T04:50:00+08:00",
+          "type": "text",
+          "content": "第 120 条演示消息：站会进度同步。",
+          "is_outgoing": false
+        }
+      ]
+    },
+    {
+      "id": "demo-chat-empty",
+      "name": "演示 · 空会话（虚构）",
+      "kind": "direct",
+      "messages": []
+    }
+  ]
+}

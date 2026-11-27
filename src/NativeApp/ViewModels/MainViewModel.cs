@@ -1,0 +1,703 @@
+using System.Collections.ObjectModel;
+using System.Text.Json;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Microsoft.UI.Dispatching;
+using WechatMemory.NativeApp.Models;
+using WechatMemory.NativeApp.Services;
+
+namespace WechatMemory.NativeApp.ViewModels;
+
+public partial class MainViewModel : ObservableObject, IAsyncDisposable
+{
+    private readonly DispatcherQueue _dispatcher;
+    private readonly bool _demoMode;
+    private WorkerClient? _worker;
+    private int? _nextOffset;
+    private DateRange _applied = new(null, null);
+    private readonly Dictionary<string, string> _accountNames = new(StringComparer.Ordinal);
+    private bool _closing;
+    private bool _suppressSceneDates;
+    private ConnectionMedia? _connectedMedia;
+    public ObservableCollection<Conversation> Conversations { get; } = [];
+    public ObservableCollection<ChatMessage> Messages { get; } = [];
+    public ObservableCollection<AccountItem> Accounts { get; } = [];
+    public ObservableCollection<SceneItem> Scenes { get; } = [];
+    public ObservableCollection<JobSummary> Jobs { get; } = [];
+
+    [ObservableProperty] public partial Conversation? SelectedConversation { get; set; }
+    [ObservableProperty] public partial AccountItem? SelectedAccount { get; set; }
+    [ObservableProperty] public partial SceneItem? SelectedScene { get; set; }
+    [ObservableProperty] public partial DateTimeOffset? StartDate { get; set; }
+    [ObservableProperty] public partial DateTimeOffset? EndDate { get; set; }
+    [ObservableProperty] public partial string SearchQuery { get; set; } = "";
+    [ObservableProperty] public partial string ConversationQuery { get; set; } = "";
+    [ObservableProperty] public partial bool IsBusy { get; set; }
+    [ObservableProperty] public partial bool IsConnected { get; set; }
+    [ObservableProperty] public partial bool FiltersDirty { get; set; }
+    [ObservableProperty] public partial bool UseWechat { get; set; }
+    [ObservableProperty] public partial bool EnableImages { get; set; }
+    [ObservableProperty] public partial bool EnableVoice { get; set; }
+    [ObservableProperty] public partial string Status { get; set; } = "正在检测本机微信…";
+    [ObservableProperty] public partial string Error { get; set; } = "";
+    [ObservableProperty] public partial string ResultPath { get; set; } = "";
+    [ObservableProperty] public partial string ResultSummary { get; set; } = "";
+    [ObservableProperty] public partial string RangeLabel { get; set; } = "全部日期 · UTC+08:00";
+    [ObservableProperty] public partial string MessageSummary { get; set; } = "请选择一个会话。";
+    [ObservableProperty] public partial string ConnectionLabel { get; set; } = "尚未连接";
+    [ObservableProperty] public partial string ProgressLabel { get; set; } = "";
+    [ObservableProperty] public partial string VoiceStatusText { get; set; } = "语音未启用";
+    [ObservableProperty] public partial string TargetKind { get; set; } = "none";
+    [ObservableProperty] public partial string TargetFolder { get; set; } = "";
+    [ObservableProperty] public partial string ObsidianVault { get; set; } = "";
+    [ObservableProperty] public partial bool ExportMarkdown { get; set; } = true;
+    [ObservableProperty] public partial bool ExportJson { get; set; }
+    [ObservableProperty] public partial bool ExportPdf { get; set; }
+    [ObservableProperty] public partial bool IncludePngPages { get; set; }
+    [ObservableProperty] public partial string CustomSceneName { get; set; } = "";
+    [ObservableProperty] public partial string CustomScenePrompt { get; set; } = "";
+    [ObservableProperty] public partial string AccountHint { get; set; } = "正在检测微信账户…";
+
+    public bool CanWork => IsConnected && !IsBusy;
+    public bool CanExport => CanWork && SelectedConversation is not null && !FiltersDirty;
+    public bool CanLoadMore => CanExport && _nextOffset is not null;
+    public bool HasError => Error.Length > 0;
+    public bool HasResult => ResultPath.Length > 0;
+    public bool HasResultSummary => ResultSummary.Length > 0;
+    public bool IsEmpty => !IsBusy && Messages.Count == 0;
+    public string SelectedTitle => SelectedConversation?.Title ?? "消息预览";
+    public bool CanConnect => !IsBusy;
+    public bool CanConnectWechat => !IsBusy && !IsConnected && Accounts.Count > 0;
+    public bool CanTranscribe => CanWork && SelectedConversation is not null && EnableVoice && !FiltersDirty
+        && (_demoMode || _connectedMedia?.VoiceReady == true);
+    public bool IsWechatMode => !_demoMode;
+    public bool IsDemoMode => _demoMode;
+    public string SourceLabel => _demoMode
+        ? "自动化测试数据 · 不读取微信"
+        : "本机微信 4.x · 只读 · 本地处理";
+    public string SelectedScenePrompt => SelectedScene?.Prompt ?? "";
+    public bool HasScenePrompt => !string.IsNullOrWhiteSpace(SelectedScenePrompt);
+    public bool CanSaveScene => CanWork && CustomSceneName.Trim().Length > 0 && CustomScenePrompt.Trim().Length > 0;
+    public bool CanDeleteScene => SelectedScene is { Builtin: false };
+    public bool HasJobs => Jobs.Count > 0;
+    public bool CanExportJob => CanWork && SelectedConversation is not null && !FiltersDirty && (ExportMarkdown || ExportJson || ExportPdf);
+
+    public IAsyncRelayCommand ReconnectCommand { get; }
+    public IAsyncRelayCommand ConnectWechatCommand { get; }
+    public IAsyncRelayCommand RefreshAccountsCommand { get; }
+    public IAsyncRelayCommand DisconnectCommand { get; }
+    public IAsyncRelayCommand SearchConversationsCommand { get; }
+    public IAsyncRelayCommand ApplyFiltersCommand { get; }
+    public IAsyncRelayCommand ClearFiltersCommand { get; }
+    public IAsyncRelayCommand LoadMoreCommand { get; }
+    public IAsyncRelayCommand ExportJobCommand { get; }
+    public IAsyncRelayCommand SaveSceneCommand { get; }
+    public IAsyncRelayCommand DeleteSceneCommand { get; }
+    public IAsyncRelayCommand RefreshJobsCommand { get; }
+    public IAsyncRelayCommand TranscribeCommand { get; }
+    public IAsyncRelayCommand RefreshVoiceCommand { get; }
+    public IAsyncRelayCommand PrepareVoiceCommand { get; }
+
+    public MainViewModel(DispatcherQueue dispatcher)
+    {
+        _dispatcher = dispatcher;
+        _demoMode = StartupOptions.DemoMode;
+        UseWechat = !_demoMode;
+        ReconnectCommand = new AsyncRelayCommand(InitializeAsync, () => !IsBusy);
+        ConnectWechatCommand = new AsyncRelayCommand(ConnectWechatAsync, () => CanConnectWechat);
+        RefreshAccountsCommand = new AsyncRelayCommand(RefreshAccountsAsync, () => !IsBusy);
+        DisconnectCommand = new AsyncRelayCommand(DisconnectAsync, () => IsConnected && !IsBusy);
+        SearchConversationsCommand = new AsyncRelayCommand(SearchConversationsAsync, () => CanWork);
+        ApplyFiltersCommand = new AsyncRelayCommand(() => RunAsync(() => FetchAsync(false), "正在筛选消息…"), () => CanWork && SelectedConversation is not null);
+        ClearFiltersCommand = new AsyncRelayCommand(async () =>
+        {
+            StartDate = null; EndDate = null; SearchQuery = "";
+            await RunAsync(() => FetchAsync(false), "正在加载全部日期…");
+        }, () => CanWork && SelectedConversation is not null);
+        LoadMoreCommand = new AsyncRelayCommand(() => RunAsync(() => FetchAsync(true), "正在加载下一页…"), () => CanLoadMore);
+        ExportJobCommand = new AsyncRelayCommand(ExportJobAsync, () => CanExportJob);
+        SaveSceneCommand = new AsyncRelayCommand(SaveSceneAsync, () => CanSaveScene);
+        DeleteSceneCommand = new AsyncRelayCommand(DeleteSceneAsync, () => CanDeleteScene);
+        RefreshJobsCommand = new AsyncRelayCommand(LoadJobsAsync, () => CanWork);
+        TranscribeCommand = new AsyncRelayCommand(TranscribeAsync, () => CanTranscribe);
+        RefreshVoiceCommand = new AsyncRelayCommand(RefreshVoiceStatusAsync, () => CanWork);
+        PrepareVoiceCommand = new AsyncRelayCommand(PrepareVoiceModelAsync, () => CanWork);
+        Status = _demoMode ? "正在准备测试数据…" : "正在检测本机微信…";
+        AccountHint = _demoMode ? "自动化测试数据，不读取微信。" : "正在检测微信账户…";
+    }
+
+    partial void OnSelectedConversationChanged(Conversation? value)
+    {
+        Messages.Clear(); _nextOffset = null;
+        ResultPath = ""; ResultSummary = "";
+        UpdateFlags();
+        if (value is not null && CanWork) _ = ApplyFiltersCommand.ExecuteAsync(null);
+    }
+    partial void OnStartDateChanged(DateTimeOffset? value) { if (!_suppressSceneDates) MarkDirty(); }
+    partial void OnEndDateChanged(DateTimeOffset? value) { if (!_suppressSceneDates) MarkDirty(); }
+    partial void OnSearchQueryChanged(string value) => MarkDirty();
+    partial void OnUseWechatChanged(bool value)
+    {
+        _connectedMedia = null;
+        if (IsConnected) { IsConnected = false; ConnectionLabel = "请重新连接"; }
+        if (!value && _worker?.IsAvailable == true) _ = DisconnectSourceInBackgroundAsync();
+        Conversations.Clear(); Messages.Clear(); Accounts.Clear(); SelectedAccount = null;
+        AccountHint = value ? "点击刷新账户，然后连接；连接会重启微信一次。" : "演示数据不读取任何微信数据。";
+        Status = value ? "已切换到真实微信（只读），请刷新账户并连接。" : "已切换到演示数据，请重新连接。";
+        UpdateFlags();
+    }
+
+    private async Task DisconnectSourceInBackgroundAsync()
+    {
+        var worker = _worker;
+        if (worker?.IsAvailable != true) return;
+        try { await worker.RequestAsync("disconnect", new { }, TimeSpan.FromSeconds(10)); }
+        catch (WorkerException) { }
+    }
+    partial void OnSelectedSceneChanged(SceneItem? value)
+    {
+        if (value is null) return;
+        if (!SceneWindowResolver.TryResolve(value, DateTimeOffset.UtcNow, out var window, out var dateError))
+        {
+            Error = dateError;
+            Status = "场景的日期范围无效，未应用该场景。";
+            OnPropertyChanged(nameof(SelectedScenePrompt));
+            OnPropertyChanged(nameof(HasScenePrompt));
+            return;
+        }
+        _suppressSceneDates = true;
+        try
+        {
+            StartDate = window.StartDate;
+            EndDate = window.EndDate;
+        }
+        finally { _suppressSceneDates = false; }
+        // A scene replaces the whole filter: a scene without a query must not
+        // inherit the previous keyword.
+        SearchQuery = value.Query ?? "";
+        OnPropertyChanged(nameof(SelectedScenePrompt));
+        OnPropertyChanged(nameof(HasScenePrompt));
+        Status = $"已应用场景：{value.Name}。日期与关键词已更新，请应用筛选。";
+        MarkDirty();
+    }
+    partial void OnTargetKindChanged(string value) => UpdateFlags();
+    partial void OnExportMarkdownChanged(bool value) => UpdateFlags();
+    partial void OnExportJsonChanged(bool value) => UpdateFlags();
+    partial void OnExportPdfChanged(bool value) => UpdateFlags();
+    partial void OnEnableVoiceChanged(bool value)
+    {
+        UpdateFlags();
+        if (_demoMode || !IsConnected || _connectedMedia is null) return;
+        if (!_connectedMedia.NeedsVoiceReconnect(value)) return;
+        // The worker builds its voice cache only during connect, exactly like the
+        // image cache. Require the same explicit reconnect; never restart WeChat
+        // from a checkbox change.
+        _connectedMedia = null;
+        IsConnected = false;
+        ConnectionLabel = "语音选项已更改 · 请重新连接";
+        Status = "开启语音转写需要重新连接微信后生效。请点击“连接微信”并按提示确认重启微信。";
+    }
+    partial void OnEnableImagesChanged(bool value)
+    {
+        UpdateFlags();
+        if (_demoMode || !IsConnected || _connectedMedia is null) return;
+        if (!_connectedMedia.NeedsImageReconnect(value)) return;
+        // The worker opened its image cache (or not) during connect. Flipping the
+        // checkbox cannot update that source, so require an explicit reconnect;
+        // the Connect button's confirmation dialog prevents a silent WeChat restart.
+        _connectedMedia = null;
+        IsConnected = false;
+        ConnectionLabel = "图片选项已更改 · 请重新连接";
+        Status = "开启图片恢复需要重新连接微信后生效。请点击“连接微信”并按提示确认重启微信。";
+    }
+    partial void OnIsBusyChanged(bool value) => UpdateFlags();
+    partial void OnIsConnectedChanged(bool value) => UpdateFlags();
+    partial void OnFiltersDirtyChanged(bool value) => UpdateFlags();
+    partial void OnErrorChanged(string value) => OnPropertyChanged(nameof(HasError));
+    partial void OnResultPathChanged(string value) => OnPropertyChanged(nameof(HasResult));
+    partial void OnResultSummaryChanged(string value) => OnPropertyChanged(nameof(HasResultSummary));
+    partial void OnSelectedAccountChanged(AccountItem? value) => UpdateFlags();
+    partial void OnCustomSceneNameChanged(string value) => UpdateFlags();
+    partial void OnCustomScenePromptChanged(string value) => UpdateFlags();
+
+    private void MarkDirty()
+    {
+        if (!IsConnected) return;
+        FiltersDirty = true;
+        Status = "筛选条件已修改，请应用筛选后再导出。";
+        UpdateFlags();
+    }
+
+    private void UpdateFlags()
+    {
+        foreach (var name in new[]
+        {
+            nameof(CanWork), nameof(CanExport), nameof(CanLoadMore), nameof(IsEmpty),
+            nameof(SelectedTitle), nameof(CanConnect), nameof(CanConnectWechat),
+            nameof(CanTranscribe), nameof(IsWechatMode), nameof(IsDemoMode), nameof(SourceLabel),
+            nameof(CanSaveScene), nameof(CanDeleteScene), nameof(HasJobs), nameof(CanExportJob),
+            nameof(SelectedScenePrompt), nameof(HasScenePrompt),
+        }) OnPropertyChanged(name);
+        ReconnectCommand?.NotifyCanExecuteChanged(); ConnectWechatCommand?.NotifyCanExecuteChanged();
+        RefreshAccountsCommand?.NotifyCanExecuteChanged(); DisconnectCommand?.NotifyCanExecuteChanged();
+        SearchConversationsCommand?.NotifyCanExecuteChanged();
+        ApplyFiltersCommand?.NotifyCanExecuteChanged(); ClearFiltersCommand?.NotifyCanExecuteChanged();
+        LoadMoreCommand?.NotifyCanExecuteChanged(); ExportJobCommand?.NotifyCanExecuteChanged();
+        SaveSceneCommand?.NotifyCanExecuteChanged(); DeleteSceneCommand?.NotifyCanExecuteChanged();
+        RefreshJobsCommand?.NotifyCanExecuteChanged(); TranscribeCommand?.NotifyCanExecuteChanged();
+        RefreshVoiceCommand?.NotifyCanExecuteChanged(); PrepareVoiceCommand?.NotifyCanExecuteChanged();
+    }
+
+    private string CurrentSource => UseWechat ? "wechat4" : "demo";
+
+    // ------------------------------------------------------------------ //
+    // Connection
+    // ------------------------------------------------------------------ //
+
+    /// <summary>
+    /// Starts the worker and discovers accounts. Real mode deliberately does
+    /// not connect (or restart WeChat) until the user asks to connect.
+    /// </summary>
+    public Task InitializeAsync() => RunAsync(async () =>
+    {
+        _connectedMedia = null;
+        IsConnected = false;
+        Conversations.Clear(); Messages.Clear(); Jobs.Clear();
+        ResultPath = ""; ResultSummary = "";
+        var current = await StartWorkerAsync();
+
+        if (_demoMode)
+        {
+            IsConnected = true;
+            ConnectionLabel = "自动化测试数据 · 本地工作进程";
+            Status = "测试数据已连接。";
+            AppLog.Write("demo_connected");
+            await LoadConversationsAsync();
+            await RefreshAuxiliaryAsync(current);
+            OnPropertyChanged(nameof(ConnectionLabel));
+            return;
+        }
+
+        ConnectionLabel = "尚未连接";
+        await RefreshAccountsCoreAsync(current);
+        Status = Accounts.Count == 0
+            ? "没有找到微信账户。请先登录微信，然后点击“刷新”。"
+            : $"找到 {Accounts.Count} 个微信账户。请选择账户后点击“连接微信”。";
+        OnPropertyChanged(nameof(ConnectionLabel));
+    }, _demoMode ? "正在准备测试数据…" : "正在检测微信账户…");
+
+    private async Task<WorkerClient> StartWorkerAsync()
+    {
+        if (_worker is not null) await _worker.DisposeAsync();
+        _worker = WorkerClient.Start(WorkerLocator.Locate());
+        var current = _worker;
+        current.DiagnosticReceived += () => AppLog.Write("worker_diagnostic_received");
+        current.ProgressReceived += progress => _dispatcher.TryEnqueue(() =>
+        {
+            if (!ReferenceEquals(_worker, current)) return;
+            ProgressLabel = progress.Total > 0 ? $"{progress.Label}（{progress.Current}/{progress.Total}）" : progress.Label;
+            if (!string.IsNullOrWhiteSpace(progress.Label)) Status = progress.Label;
+        });
+        current.Disconnected += failure => _dispatcher.TryEnqueue(() =>
+        {
+            if (_closing || !ReferenceEquals(_worker, current)) return;
+            _connectedMedia = null;
+            IsConnected = false; ConnectionLabel = "连接已断开";
+            Error = failure.Message; Status = "任务未完成，可重新检测。";
+            AppLog.Write("worker_disconnected", failure.Code);
+        });
+        var hello = await current.RequestAsync("hello", new { });
+        if (hello.GetProperty("protocolVersion").GetInt32() != Protocol.Version || hello.GetProperty("timezone").GetString() != "UTC+08:00")
+            throw new WorkerException("PROTOCOL_ERROR", "工作进程的协议或时区不兼容。");
+        return current;
+    }
+
+    private async Task ConnectWechatAsync() => await RunAsync(async () =>
+    {
+        _connectedMedia = null;
+        IsConnected = false;
+        var current = _worker is { IsAvailable: true } ? _worker : await StartWorkerAsync();
+        await RefreshAccountsCoreAsync(current);
+        if (SelectedAccount is null)
+            throw new WorkerException("ACCOUNT_NOT_FOUND", "没有找到可用的微信账户。请先登录微信，然后刷新账户。");
+        Status = "正在连接微信。连接会重启微信一次，并可能要求在手机上确认登录…";
+        var connected = (await current.RequestAsync("connect", new
+        {
+            source = "wechat4", accountToken = SelectedAccount.Token,
+            enableImages = EnableImages, enableVoice = EnableVoice
+        }, TimeSpan.FromMinutes(6))).Deserialize<ConnectResult>(Protocol.Json)
+            ?? throw new WorkerException("PROTOCOL_ERROR", "微信连接结果格式不正确。");
+        _connectedMedia = new ConnectionMedia(EnableImages, connected.ImageKeyAvailable,
+            EnableVoice, connected.VoiceAvailable);
+        IsConnected = true;
+        RememberAccountName(connected.AccountLabel);
+        ConnectionLabel = $"{connected.AccountLabel ?? SelectedAccount.Label} · 只读";
+        Status = $"微信已连接：{connected.ConversationCount} 个会话，{connected.MessageTableCount} 张消息表。";
+        AppLog.Write("wechat_connected");
+        await LoadConversationsAsync();
+        await RefreshAuxiliaryAsync(current);
+        if (EnableImages && !connected.ImageKeyAvailable)
+            Status = "微信已连接，但没有取得图片密钥，图片恢复不可用。";
+        OnPropertyChanged(nameof(ConnectionLabel));
+    }, "正在连接微信…");
+
+    private async Task RefreshAccountsAsync() => await RunAsync(async () =>
+    {
+        var current = _worker is { IsAvailable: true } ? _worker : await StartWorkerAsync();
+        await RefreshAccountsCoreAsync(current);
+        if (SelectedAccount is null) throw new WorkerException("ACCOUNT_NOT_FOUND", "没有找到可用的微信账户。");
+        Status = $"已找到 {Accounts.Count} 个微信账户，请点击“连接微信”。";
+    }, "正在检测本机微信账户…");
+
+    private async Task RefreshAccountsCoreAsync(WorkerClient worker)
+    {
+        var previousToken = SelectedAccount?.Token;
+        var list = (await worker.RequestAsync("list_accounts", new { }, TimeSpan.FromSeconds(60)))
+            .Deserialize<AccountList>(Protocol.Json) ?? new AccountList([]);
+        Accounts.Clear();
+        foreach (var item in list.Items)
+        {
+            Accounts.Add(_accountNames.TryGetValue(item.Token, out var name) && !string.IsNullOrWhiteSpace(name)
+                ? item with { Label = name }
+                : item);
+        }
+        SelectedAccount = Accounts.FirstOrDefault(item => item.Token == previousToken) ?? Accounts.FirstOrDefault();
+        AccountHint = Accounts.Count == 0
+            ? "没有找到微信 4.x 数据目录。请确认微信已登录过。"
+            : $"找到 {Accounts.Count} 个账户。连接会重启微信一次，连接后显示微信昵称。";
+        UpdateFlags();
+    }
+
+    private void RememberAccountName(string? name)
+    {
+        if (SelectedAccount is null || string.IsNullOrWhiteSpace(name) ||
+            name.StartsWith("微信账户", StringComparison.Ordinal))
+            return;
+        _accountNames[SelectedAccount.Token] = name;
+        int index = Accounts.IndexOf(SelectedAccount);
+        if (index < 0) return;
+        var updated = SelectedAccount with { Label = name };
+        Accounts[index] = updated;
+        SelectedAccount = updated;
+    }
+
+    private async Task DisconnectAsync() => await RunAsync(async () =>
+    {
+        if (_worker?.IsAvailable == true)
+        {
+            try { await _worker.RequestAsync("disconnect", new { }, TimeSpan.FromSeconds(10)); }
+            catch (WorkerException) { }
+        }
+        _connectedMedia = null;
+        IsConnected = false; ConnectionLabel = "已断开";
+        Conversations.Clear(); Messages.Clear(); Jobs.Clear();
+        Status = "已断开微信。工作进程仍在运行。";
+    }, "正在断开…");
+
+    private async Task LoadConversationsAsync(string? query = null)
+    {
+        var current = _worker ?? throw new WorkerException("WORKER_EXITED", "工作进程不可用。");
+        var previousId = SelectedConversation?.Id;
+        var list = (await current.RequestAsync("list_conversations", new { source = CurrentSource, query }))
+            .Deserialize<ConversationResult>(Protocol.Json)
+            ?? throw new WorkerException("PROTOCOL_ERROR", "会话列表格式不正确。");
+        Conversations.Clear(); Messages.Clear(); ResultPath = ""; ResultSummary = "";
+        foreach (var item in list.Items) Conversations.Add(item);
+        OnPropertyChanged(nameof(SelectedConversation));
+        SelectedConversation = Conversations.FirstOrDefault(item => item.Id == previousId) ?? Conversations.FirstOrDefault();
+        OnPropertyChanged(nameof(SelectedTitle));
+        if (SelectedConversation is null) { MessageSummary = "没有可用会话。"; Status = "没有会话可显示。"; return; }
+        await FetchAsync(false);
+    }
+
+    private Task SearchConversationsAsync() => RunAsync(async () =>
+    {
+        var query = string.IsNullOrWhiteSpace(ConversationQuery) ? null : ConversationQuery.Trim();
+        await LoadConversationsAsync(query);
+        Status = query is null ? "已显示全部会话。" : $"已按会话名称筛选：{query}";
+    }, "正在筛选会话…");
+
+    private async Task RefreshAuxiliaryAsync(WorkerClient current)
+    {
+        try
+        {
+            await current.RequestAsync("recover_jobs", new { }, TimeSpan.FromSeconds(60));
+        }
+        catch (WorkerException) { }
+        await LoadScenesAsync(current);
+        await LoadJobsCoreAsync(current);
+        // faster-whisper can take seconds to import; never hold the connected UI on it.
+        _ = RefreshVoiceStatusCoreAsync(current);
+    }
+
+    // ------------------------------------------------------------------ //
+    // Messages and export
+    // ------------------------------------------------------------------ //
+
+    private async Task FetchAsync(bool more)
+    {
+        if (SelectedConversation is null) { MessageSummary = "没有可用会话。"; Status = "没有会话。"; return; }
+        var range = more ? _applied : DateRange.Create(StartDate, EndDate);
+        var query = string.IsNullOrWhiteSpace(SearchQuery) ? null : SearchQuery.Trim();
+        var result = (await _worker!.RequestAsync("get_messages", new
+        {
+            source = CurrentSource, conversationId = SelectedConversation.Id,
+            startDate = range.StartDate, endDate = range.EndDate,
+            query, order = "desc", offset = more ? _nextOffset ?? 0 : 0, limit = 50
+        })).Deserialize<MessageResult>(Protocol.Json) ?? throw new WorkerException("PROTOCOL_ERROR", "消息列表格式不正确。");
+        if (!more) Messages.Clear();
+        foreach (var item in result.Items) Messages.Add(item);
+        _nextOffset = result.NextOffset; _applied = range;
+        FiltersDirty = false;
+        RangeLabel = query is null ? range.Label : $"{range.Label} · 搜索“{query}”";
+        MessageSummary = result.Total == 0 ? "此会话题在所选条件下没有消息。" : $"已显示 {Messages.Count} / {result.Total} 条消息";
+        Status = result.Total == 0 ? "筛选完成，没有符合条件的消息。" : "消息已加载，可按当前范围导出。";
+        UpdateFlags();
+    }
+
+    public Task ExportAsync(string path) => ExportAsync(path, "markdown", false);
+
+    public Task ExportAsync(string path, string format, bool includePages) => RunAsync(async () =>
+    {
+        if (SelectedConversation is null || FiltersDirty) throw new WorkerException("INVALID_ARGUMENT", "请先选择会话并应用筛选。");
+        var range = _applied;
+        var query = string.IsNullOrWhiteSpace(SearchQuery) ? null : SearchQuery.Trim();
+        var command = format switch
+        {
+            "json" => "export_json",
+            "pdf" => "export_pdf",
+            _ => "export_markdown",
+        };
+        string? pagesDir = null;
+        if (format == "pdf" && includePages)
+            pagesDir = Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileNameWithoutExtension(path) + "_pages");
+        var result = (await _worker!.RequestAsync(command, new
+        {
+            source = CurrentSource, conversationId = SelectedConversation.Id,
+            startDate = range.StartDate, endDate = range.EndDate, query,
+            outputPath = path, overwrite = true,
+            pagesDir, materializeMedia = EnableImages,
+        }, format == "pdf" ? TimeSpan.FromMinutes(10) : TimeSpan.FromSeconds(120)))
+            .Deserialize<ExportDetail>(Protocol.Json) ?? throw new WorkerException("PROTOCOL_ERROR", "导出结果格式不正确。");
+        if (!File.Exists(result.Path)) throw new WorkerException("EXPORT_FAILED", "工作进程未生成导出文件。");
+        ResultPath = result.Path;
+        ResultSummary = format switch
+        {
+            "pdf" => $"{result.MessageCount} 条消息 · {result.PageCount} 页 · {result.Bytes:N0} 字节",
+            _ => $"{result.MessageCount} 条消息 · {result.Bytes:N0} 字节",
+        };
+        Status = $"导出完成：{ResultSummary}";
+        AppLog.Write("export_completed", format.ToUpperInvariant());
+    }, format == "pdf" ? "正在生成 PDF…" : "正在导出…");
+
+    // ------------------------------------------------------------------ //
+    // Scenes, jobs and delivery
+    // ------------------------------------------------------------------ //
+
+    private async Task LoadScenesAsync(WorkerClient? worker = null)
+    {
+        worker ??= _worker;
+        if (worker?.IsAvailable != true) return;
+        try
+        {
+            var list = (await worker.RequestAsync("list_scenes", new { }, TimeSpan.FromSeconds(60)))
+                .Deserialize<SceneList>(Protocol.Json);
+            if (list is null) return;
+            Scenes.Clear();
+            foreach (var item in list.Items) Scenes.Add(item);
+            OnPropertyChanged(nameof(Scenes));
+        }
+        catch (WorkerException e) when (e.Code is "CAPABILITY_UNAVAILABLE" or "JOB_STORE_UNAVAILABLE" or "SCENE_INVALID")
+        {
+            Scenes.Clear();
+        }
+        catch (WorkerException) { }
+    }
+
+    private async Task SaveSceneAsync() => await RunAsync(async () =>
+    {
+        var scene = SceneDraft.Create(
+            SceneDraft.NewId(DateTimeOffset.UtcNow),
+            CustomSceneName.Trim(),
+            StartDate,
+            EndDate,
+            string.IsNullOrWhiteSpace(SearchQuery) ? null : SearchQuery.Trim(),
+            includeImagePages: true,
+            markdown: ExportMarkdown,
+            jsonOutput: ExportJson,
+            target: TargetKind == "none" ? "folder" : TargetKind,
+            prompt: CustomScenePrompt.Trim());
+        await _worker!.RequestAsync("save_scene", new { scene }, TimeSpan.FromSeconds(60));
+        CustomSceneName = ""; CustomScenePrompt = "";
+        await LoadScenesAsync();
+        Status = "场景已保存。";
+    }, "正在保存场景…");
+
+    private async Task DeleteSceneAsync() => await RunAsync(async () =>
+    {
+        if (SelectedScene is null || SelectedScene.Builtin) return;
+        await _worker!.RequestAsync("delete_scene", new { sceneId = SelectedScene.Id }, TimeSpan.FromSeconds(60));
+        await LoadScenesAsync();
+        Status = "场景已删除。";
+    }, "正在删除场景…");
+
+    private async Task ExportJobAsync() => await RunAsync(async () =>
+    {
+        if (SelectedConversation is null || FiltersDirty) throw new WorkerException("INVALID_ARGUMENT", "请先选择会话并应用筛选。");
+        var formats = new List<string>();
+        if (ExportMarkdown) formats.Add("markdown");
+        if (ExportJson) formats.Add("json");
+        if (ExportPdf) formats.Add("pdf");
+        if (formats.Count == 0) throw new WorkerException("INVALID_ARGUMENT", "请至少选择一种导出格式。");
+        object target = TargetKind switch
+        {
+            "folder" when !string.IsNullOrWhiteSpace(TargetFolder) => new { kind = "folder", root = TargetFolder, organizeByDate = true },
+            "obsidian" when !string.IsNullOrWhiteSpace(ObsidianVault) => new { kind = "obsidian", vault = ObsidianVault, folder = "微信记忆", attachments = "_附件", dedupe = true },
+            _ => new { kind = "none" },
+        };
+        var query = string.IsNullOrWhiteSpace(SearchQuery) ? null : SearchQuery.Trim();
+        var result = await _worker!.RequestAsync("export_job", new
+        {
+            source = CurrentSource, conversationId = SelectedConversation.Id,
+            startDate = _applied.StartDate, endDate = _applied.EndDate, query,
+            formats, target, sceneId = SelectedScene?.Id,
+        }, TimeSpan.FromMinutes(10));
+        var job = result.GetProperty("job").Deserialize<JobSummary>(Protocol.Json);
+        if (job is null) throw new WorkerException("PROTOCOL_ERROR", "任务结果格式不正确。");
+        ResultPath = job.Directory ?? "";
+        ResultSummary = job.Summary;
+        Status = $"任务 {job.JobId} 已创建：{job.StatusLabel}。";
+        await LoadJobsCoreAsync(_worker);
+        AppLog.Write("job_created");
+    }, "正在生成任务与导出文件…");
+
+    private Task LoadJobsAsync() => RunAsync(async () =>
+    {
+        await LoadJobsCoreAsync(_worker);
+        Status = Jobs.Count == 0 ? "暂无任务记录。" : $"已加载 {Jobs.Count} 个任务。";
+    }, "正在读取任务历史…");
+
+    private async Task LoadJobsCoreAsync(WorkerClient? worker)
+    {
+        if (worker?.IsAvailable != true) return;
+        try
+        {
+            var list = (await worker.RequestAsync("list_jobs", new { limit = 80 }, TimeSpan.FromSeconds(60)))
+                .Deserialize<JobList>(Protocol.Json);
+            if (list is null) return;
+            Jobs.Clear();
+            foreach (var item in list.Items) Jobs.Add(item);
+            OnPropertyChanged(nameof(Jobs)); OnPropertyChanged(nameof(HasJobs));
+        }
+        catch (WorkerException e) when (e.Code is "CAPABILITY_UNAVAILABLE" or "JOB_STORE_UNAVAILABLE")
+        {
+            Jobs.Clear();
+        }
+        catch (WorkerException) { }
+    }
+
+    public Task DeliverJobAsync(JobSummary job) => RunAsync(async () =>
+    {
+        object target = TargetKind switch
+        {
+            "folder" when !string.IsNullOrWhiteSpace(TargetFolder) => new { kind = "folder", root = TargetFolder, organizeByDate = true },
+            "obsidian" when !string.IsNullOrWhiteSpace(ObsidianVault) => new { kind = "obsidian", vault = ObsidianVault, folder = "微信记忆", attachments = "_附件", dedupe = true },
+            _ => throw new WorkerException("INVALID_ARGUMENT", "请先选择文件夹或 Obsidian 目标。"),
+        };
+        var response = await _worker!.RequestAsync("deliver_job", new { jobId = job.JobId, target }, TimeSpan.FromMinutes(5));
+        var delivery = DeliveryOutcome.Parse(response);
+        await LoadJobsCoreAsync(_worker);
+        // deliver_job returns ok:true even when the copy failed; the delivery
+        // object is the only authoritative success signal.
+        delivery.ThrowIfFailed();
+        Status = "任务已重新投递。";
+    }, "正在投递任务…");
+
+    // ------------------------------------------------------------------ //
+    // Voice
+    // ------------------------------------------------------------------ //
+
+    private Task RefreshVoiceStatusAsync() => RunAsync(async () =>
+    {
+        await RefreshVoiceStatusCoreAsync(_worker);
+        Status = "已刷新语音状态。";
+    }, "正在检查语音组件…");
+
+    private async Task RefreshVoiceStatusCoreAsync(WorkerClient? worker)
+    {
+        if (worker?.IsAvailable != true) return;
+        try
+        {
+            var status = (await worker.RequestAsync("voice_status", new { }, TimeSpan.FromSeconds(60)))
+                .Deserialize<VoiceStatus>(Protocol.Json);
+            if (status is not null) VoiceStatusText = status.Summary;
+        }
+        catch (WorkerException e) when (e.Code is "CAPABILITY_UNAVAILABLE") { VoiceStatusText = "语音组件不可用"; }
+        catch (WorkerException) { VoiceStatusText = "语音状态不可用"; }
+    }
+
+    public async Task PrepareVoiceModelAsync()
+    {
+        if (_worker?.IsAvailable != true) { Error = "工作进程未连接。"; return; }
+        await RunAsync(async () =>
+        {
+            await _worker.RequestAsync("prepare_voice_model", new { consent = true }, TimeSpan.FromMinutes(30));
+            await RefreshVoiceStatusCoreAsync(_worker);
+            Status = "语音模型已准备好，可以转写当前会话的语音。";
+            AppLog.Write("voice_model_ready");
+        }, "正在下载或加载语音模型（首次可能需要较长时间）…");
+    }
+
+    private Task TranscribeAsync() => RunAsync(async () =>
+    {
+        if (SelectedConversation is null) throw new WorkerException("INVALID_ARGUMENT", "请先选择会话。");
+        var query = string.IsNullOrWhiteSpace(SearchQuery) ? null : SearchQuery.Trim();
+        var result = (await _worker!.RequestAsync("transcribe_messages", new
+        {
+            source = CurrentSource, conversationId = SelectedConversation.Id,
+            startDate = _applied.StartDate, endDate = _applied.EndDate, query,
+        }, TimeSpan.FromMinutes(30))).Deserialize<TranscribeResult>(Protocol.Json);
+        await FetchAsync(false);
+        Status = result is null ? "语音转写完成。" : $"语音转写完成：{result.Transcribed} / {result.Total} 条消息有转写。";
+        AppLog.Write("voice_transcribed");
+    }, "正在本地转写语音…");
+
+    // ------------------------------------------------------------------ //
+    // Error / lifecycle
+    // ------------------------------------------------------------------ //
+
+    public void ShowError(string message, string code)
+    {
+        Error = message; Status = "操作未完成。"; AppLog.Write("ui_operation_failed", code);
+    }
+
+    private async Task RunAsync(Func<Task> operation, string status)
+    {
+        if (IsBusy || _closing) return;
+        IsBusy = true; Error = ""; Status = status; ProgressLabel = "";
+        try { await operation(); }
+        catch (WorkerException e)
+        {
+            Error = e.Message; Status = "任务未完成。"; AppLog.Write("request_failed", e.Code);
+            if (e.Code == "WECHAT_LOGIN_TIMEOUT")
+                AccountHint = "微信登录超时。请手动打开并登录微信，然后点击“刷新”再试。";
+            else if (e.Code == "WECHAT_KEY_UNAVAILABLE")
+                AccountHint = "无法读取微信进程。请确认微信能正常启动，必要时重启电脑后再试。";
+            else if (e.Code is "WECHAT_NOT_FOUND" or "WECHAT_EXE_NOT_FOUND")
+                AccountHint = "没有找到微信 4.x。请先安装并登录微信，然后点击“刷新”。";
+            if (_worker?.IsAvailable != true) { IsConnected = false; ConnectionLabel = "工作进程不可用"; }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or KeyNotFoundException or InvalidOperationException or FormatException)
+        {
+            Error = "处理结果失败。请重新连接或检查输出文件夹权限。"; Status = "任务未完成。";
+            AppLog.Write("result_failed", e.GetType().Name);
+        }
+        finally { IsBusy = false; ProgressLabel = ""; }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _closing = true; IsConnected = false;
+        if (_worker is not null) await _worker.DisposeAsync();
+    }
+}

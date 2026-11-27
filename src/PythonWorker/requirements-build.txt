@@ -1,0 +1,4 @@
+# Build-time only. The worker runtime is installed from requirements.txt.
+-r requirements.txt
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10

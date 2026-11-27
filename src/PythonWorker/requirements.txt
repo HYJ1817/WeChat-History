@@ -1,0 +1,13 @@
+# Runtime dependencies for the local worker.
+# The demo path uses only the standard library; the real WeChat 4.x source,
+# image recovery, PDF rendering and local speech-to-text use these packages.
+# All processing stays on this computer; no telemetry or remote AI API is used.
+frida==17.28.0
+pycryptodome==3.24.1
+zstandard==0.25.0
+pywinauto==0.6.9
+Pillow==11.3.0
+reportlab==4.5.1
+faster-whisper==1.2.1
+silk-python==0.2.9
+imageio-ffmpeg==0.8.1
