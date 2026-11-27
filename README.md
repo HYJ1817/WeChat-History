@@ -1,6 +1,6 @@
-# 微信记忆 · Windows 原生版
+# WeChat-History · 微信记忆
 
-> **直接使用**：双击 `微信记忆` 快捷方式，或打开 `微信记忆App` 文件夹双击 `NativeApp.exe`。完整项目目录中的开发缓存和测试产物默认隐藏；需要查看时在资源管理器打开“显示隐藏的项目”。分发时不要只复制 `NativeApp.exe`，要复制整个 `微信记忆App` 文件夹。
+> **直接使用**：双击 `微信记忆` 快捷方式，或打开 `微信记忆App` 文件夹双击 `WeChat-History.exe`。完整项目目录中的开发缓存和测试产物默认隐藏；需要查看时在资源管理器打开“显示隐藏的项目”。分发时不要只复制 `WeChat-History.exe`，要复制整个 `微信记忆App` 文件夹。
 
 **把本机微信 4.x 的聊天记录，只读地整理成本地 Markdown / JSON / PDF，并支持场景、任务记录与文件夹 / Obsidian 投递。**
 
@@ -100,12 +100,12 @@ WechatMemory.Worker.exe  (PyInstaller onedir, Python 3.11)
 
 ### 安装版 / 便携版
 
-从 [Releases](https://github.com/HYJ1817/WeChat-History/releases) 下载当前用户安装包 `WeChat-Memory-Setup-*.exe`，或便携包 `WeChat-Memory-Windows-*.zip`。安装包不需要管理员权限；便携包解压后运行 `微信记忆App\NativeApp.exe`，不能只复制 exe。两者都未签名，可能触发 SmartScreen/杀毒提示。
+从 [Releases](https://github.com/HYJ1817/WeChat-History/releases) 下载当前用户安装包 `WeChat-Memory-Setup-*.exe`，或便携包 `WeChat-Memory-Windows-*.zip`。安装包不需要管理员权限；便携包解压后运行 `微信记忆App\WeChat-History.exe`，不能只复制 exe。两者都未签名，可能触发 SmartScreen/杀毒提示。
 
 ### 源码运行
 
 ```powershell
-cd C:\path\to\wechat-memory
+cd C:\path\to\WeChat-History
 
 # 只读检查环境
 powershell -ExecutionPolicy Bypass -File .\scripts\Check-Environment.ps1
@@ -128,7 +128,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Run.ps1
 4. 选择会话、设置日期/关键词，点“应用筛选”；
 5. 在右侧“导出”选择 Markdown / JSON / PDF；或在“任务”页生成带历史记录的任务。
 
-> 只复制 `NativeApp.exe` 不能运行。源码运行需要保留项目目录与 `.venv`；发布运行需要保留整个发布文件夹（至少 `worker\` 与 `NativeApp.exe` 同目录）。发布版不包含 `demo\` 数据。
+> 只复制 `WeChat-History.exe` 不能运行。源码运行需要保留项目目录与 `.venv`；发布运行需要保留整个发布文件夹（至少 `worker\` 与 `WeChat-History.exe` 同目录）。发布版不包含 `demo\` 数据。
 
 ## 6. 构建、测试与发布
 
@@ -139,7 +139,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Build.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\Build.ps1 -Configuration Release
 ```
 
-输出：`src/NativeApp/bin/x64/<Debug|Release>/net10.0-windows10.0.19041.0/win-x64/NativeApp.exe`。
+输出：`src/NativeApp/bin/x64/<Debug|Release>/net10.0-windows10.0.19041.0/win-x64/WeChat-History.exe`。
 
 ### 测试
 
@@ -178,7 +178,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Publish.ps1
 运行：
 
 ```powershell
-.\微信记忆App\NativeApp.exe
+.\微信记忆App\WeChat-History.exe
 ```
 
 `artifacts/` 是本地测试与发布产物，不提交；详细说明见 [docs/final-report.md](docs/final-report.md)。
