@@ -120,9 +120,27 @@ try {
     $sitePackages = Join-Path $ProjectRoot '.venv/Lib/site-packages'
     foreach ($info in @(Get-ChildItem -LiteralPath $sitePackages -Directory -Filter '*.dist-info' -ErrorAction SilentlyContinue)) {
         $licenses = Join-Path $info.FullName 'licenses'
+        $target = Join-Path $pythonLicenseTarget $info.BaseName
         if (Test-Path -LiteralPath $licenses) {
-            $target = Join-Path $pythonLicenseTarget $info.BaseName
             Copy-Item -LiteralPath $licenses -Destination $target -Recurse -Force
+        }
+        foreach ($notice in @(Get-ChildItem -LiteralPath $info.FullName -File | Where-Object { $_.Name -match '^(LICENSE|COPYING|NOTICE|AUTHORS)' })) {
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+            Copy-Item -LiteralPath $notice.FullName -Destination $target -Force
+        }
+    }
+    # Retain the license/notice texts from the cached self-contained native
+    # runtime packages too, without copying their build tools or package caches.
+    $nativeLicenseTarget = Join-Path $publishDir 'LICENSES/native-runtime'
+    foreach ($package in @('communitytoolkit.mvvm', 'microsoft.windowsappsdk.winui', 'microsoft.windowsappsdk.base', 'microsoft.windowsappsdk.foundation', 'microsoft.windowsappsdk.interactiveexperiences', 'microsoft.web.webview2', 'microsoft.netcore.app.runtime.win-x64', 'microsoft.windowsdesktop.app.runtime.win-x64', 'microsoft.windows.sdk.net.ref')) {
+        $packageRoot = Join-Path $ProjectRoot ('.tools/packages/' + $package)
+        if (-not (Test-Path -LiteralPath $packageRoot)) { continue }
+        foreach ($version in @(Get-ChildItem -LiteralPath $packageRoot -Directory)) {
+            foreach ($notice in @(Get-ChildItem -LiteralPath $version.FullName -File | Where-Object { $_.Name -match '^(LICENSE|NOTICE|THIRDPARTY)' })) {
+                $target = Join-Path $nativeLicenseTarget ($package + '/' + $version.Name)
+                New-Item -ItemType Directory -Force -Path $target | Out-Null
+                Copy-Item -LiteralPath $notice.FullName -Destination $target -Force
+            }
         }
     }
     $pyInstallerCopying = Join-Path $sitePackages 'pyinstaller-6.22.3.dist-info/licenses/COPYING.txt'
@@ -147,6 +165,16 @@ try {
         $psi.RedirectStandardError = $true
         $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
         $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        # Never let a release smoke test inspect or sweep the user's app data
+        # or shared temporary directories. All test state belongs to this build.
+        $smokeRoot = Join-Path $publishRoot 'smoke-data'
+        $smokeLocal = Join-Path $smokeRoot 'local'
+        $smokeTemp = Join-Path $smokeRoot 'temp'
+        New-Item -ItemType Directory -Force -Path $smokeLocal, $smokeTemp | Out-Null
+        $psi.EnvironmentVariables['LOCALAPPDATA'] = $smokeLocal
+        $psi.EnvironmentVariables['TEMP'] = $smokeTemp
+        $psi.EnvironmentVariables['TMP'] = $smokeTemp
+        $psi.EnvironmentVariables['WECHAT_MEMORY_TEMP_ROOT'] = Join-Path $smokeLocal 'WechatMemoryNative/worker-temp/worker-publish-smoke'
         $process = [System.Diagnostics.Process]::Start($psi)
 
         function Send-Request([string]$line) {

@@ -5,8 +5,8 @@
 > `.tools/packages/*.nuspec`、`.venv/.../dist-info/METADATA` 与包内许可证文件。
 > 本文件是工程记录，不构成法律意见；分发前请由权利人复核。
 
-本仓库当前没有独立的项目级 `LICENSE` 文件；本文件只列出第三方组件，不能替代
-项目自身的整体许可证。
+本仓库采用根目录 `LICENSE` 中的 MIT 许可证；本文件列出第三方组件，各组件仍适用
+其自身许可证，不能以项目级 MIT 许可证替代。
 
 ## 1. 汇总
 
@@ -18,7 +18,7 @@
 | PyInstaller | **6.22.3**（`requirements-build.txt` 固定） | GPLv2-or-later，带 bootloader 特殊例外 | 仅构建期；用于生成 `WechatMemory.Worker.exe` |
 | wechat-ai-memory vendored 代码 | commit `14d94db8b1affa12a2d7d88f0f830c1e0b8d752a`，tag `v0.3.8-alpha.2` | MIT | 微信 4.x 发现/解密/密钥/媒体/语音、PDF/渲染、场景/任务/投递、模型与文本导出；随 worker 分发 |
 | Python 运行依赖 | frida 17.28.0、pycryptodome 3.24.1、zstandard 0.25.0、pywinauto 0.6.9、Pillow 11.3.0、reportlab 4.5.1、faster-whisper 1.2.1、silk-python 0.2.9、imageio-ffmpeg 0.8.1（及传递依赖） | 见第 11 节 | 真实微信读取、图片/PDF、任务、语音；随 worker 分发 |
-| FFmpeg（imageio-ffmpeg 内置） | **9.0.2 essentials build（gyan.dev）** | FFmpeg 自身许可证；该构建自称 essentials，通常为 GPLv3，**分发前必须复核** | WXGF/媒体解码；随 worker 分发，约 101 MiB |
+| FFmpeg（imageio-ffmpeg 内置） | **9.0.2 essentials build（gyan.dev）** | GPL-3.0-or-later（本机二进制 `-L` 确认）；再分发义务仍需法律复核 | WXGF/媒体解码；随 worker 分发，约 101 MiB |
 | Microsoft .NET 运行时 | `Microsoft.NETCore.App.Runtime.win-x64` / `Microsoft.WindowsDesktop.App.Runtime.win-x64` **10.0.15** | MIT（NuGet 包元数据） | dotnet publish 自包含输出 |
 | Microsoft WebView2 | `Microsoft.Web.WebView2` **1.0.3719.77** | Microsoft 提供的 BSD-3-Clause 风格许可（包内 `LICENSE.txt`） | Windows App SDK 依赖；随自包含发布输出分发 |
 | Microsoft.Windows.SDK.BuildTools | **10.0.26100.4654**（另有 MSIX 1.7.251221100） | Microsoft Windows SDK 许可（包元数据 `aka.ms/WinSDKLicenseURL`） | 仅构建期 |
@@ -143,14 +143,15 @@
 
 ## 10. 分发注意事项
 
-- `scripts/Publish.ps1` 复制本文件、`README.md`、`LICENSES/` 与 `docs/`，并收集
-  CPython、PyInstaller 与已安装 Python 包的 `dist-info/licenses` 文本到
-  `LICENSES/python-runtime/`；仍**不会**自动复制 NuGet 包、WebView2、FFmpeg 的
-  全部许可证/通知文件。正式分发前，请按本文件列出的路径补充对应文本并保留版权行。
+- `scripts/Publish.ps1` 复制本文件、项目 `LICENSE`、`README.md`、`LICENSES/` 与 `docs/`，并收集
+  CPython、PyInstaller、已安装 Python 包的 `dist-info/licenses` 及根级许可证/通知文本到
+  `LICENSES/python-runtime/`；缓存中原生运行时、Windows App SDK、WebView2 与 MVVM 包的
+  许可证/通知文本收集到 `LICENSES/native-runtime/`。FFmpeg 仍需按其实际构建单独附带许可
+  与来源说明；收集文件不代表完成法律合规审查。
 - 当前 `微信记忆App` 快照已补齐本文件、`README.md`、
   `LICENSES/` 与 `docs/`；以后重新运行 `Publish.ps1` 时会自动复制当时存在的文件。
-- 本仓库根目录当前没有项目级 `LICENSE`；在确定项目自身许可证之前，不应把本
-  仓库作为可再分发的完整产品发布。
+- 本仓库根目录的项目级 `LICENSE` 为 MIT；它不替代第三方二进制的许可证、通知与
+  源码提供义务，尤其不意味着 FFmpeg 的再分发已完成法律复核。
 - 若未来复用 DeskBox 代码，请先阅读 `reference/DeskBox/LICENSING.md`：其为
   GPL-3.0-only + 商业双许可，与 MIT 不兼容；当前仓库未复用其代码，故未附带其
   许可证。
@@ -182,10 +183,11 @@
 - 完整的包许可证文本由 `Publish.ps1` 收集到发布目录
   `LICENSES/python-runtime/<dist-info>/`。
 - **FFmpeg**：`imageio-ffmpeg` 内置 `ffmpeg-win-x86_64-v9.0.2.exe`，版本字符串为
-  `9.0.2-essentials_build-www.gyan.dev`。FFmpeg 是独立程序，按其自身许可证分发；
-  gyan.dev 的 essentials 构建通常启用 GPL 组件（常见为 GPLv3），但必须以该二进制
-  随附/发布页的许可证为准。**当前发布目录未附带 FFmpeg 的完整许可证文本，不能视为
-  已完成再分发合规审查。** 若不能接受该许可证，可移除 `imageio_ffmpeg` 包并改用
-  系统 FFmpeg，或只在内部使用、不再分发。
+  `9.0.2-essentials_build-www.gyan.dev`。2026-11-28 执行该二进制的 `-L` 确认其声明为
+  **GPL-3.0-or-later**，构建参数含 `--enable-gpl --enable-version3`。FFmpeg 是独立程序，
+  按其自身许可证分发；v0.2.0 发布材料另附 GPLv3 原文、二进制许可声明与来源链接。
+  上游构建及源码信息见 <https://www.gyan.dev/ffmpeg/builds/>，FFmpeg 源码见
+  <https://ffmpeg.org/download.html>。附带许可不代表源码提供等再分发义务已完成法律复核；
+  当前没有正式法律合规审查。若不能接受该许可证，请勿继续再分发该二进制。
 - 语音模型权重不随包分发；用户同意后从模型仓库下载，适用其各自许可证（当前默认
   faster-whisper `small` / Whisper 权重，需在分发前复核）。
