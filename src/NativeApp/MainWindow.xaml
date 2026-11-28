@@ -1,6 +1,7 @@
 <Window x:Class="WechatMemory.NativeApp.MainWindow"
  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ xmlns:local="using:WechatMemory.NativeApp"
  xmlns:models="using:WechatMemory.NativeApp.Models">
  <Grid x:Name="Root" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" SizeChanged="Root_SizeChanged" Loaded="Root_Loaded" Padding="16,0,16,12" RowSpacing="12">
   <Grid.RowDefinitions><RowDefinition Height="32"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
@@ -63,11 +64,11 @@
      </StackPanel>
      <Grid Grid.Row="5" ColumnSpacing="6">
       <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-      <TextBox Text="{x:Bind Vm.ConversationQuery, Mode=TwoWay}" PlaceholderText="按会话名称筛选" IsEnabled="{x:Bind Vm.CanWork, Mode=OneWay}" AutomationProperties.AutomationId="ConversationSearch"/>
+      <TextBox Text="{x:Bind Vm.ConversationQuery, Mode=TwoWay}" PlaceholderText="按会话名称筛选" IsEnabled="{x:Bind Vm.CanSelectConversation, Mode=OneWay}" AutomationProperties.AutomationId="ConversationSearch"/>
       <Button Grid.Column="1" Content="筛选" Command="{x:Bind Vm.SearchConversationsCommand}" AutomationProperties.AutomationId="SearchConversationsButton"/>
      </Grid>
      <TextBlock Grid.Row="6" Text="会话" FontWeight="SemiBold" Margin="0,4,0,0"/>
-     <ListView Grid.Row="7" x:Name="ConversationList" AutomationProperties.AutomationId="ConversationList" ItemsSource="{x:Bind Vm.Conversations}" SelectedItem="{x:Bind Vm.SelectedConversation, Mode=TwoWay}" IsEnabled="{x:Bind Vm.CanWork, Mode=OneWay}" SelectionMode="Single" HorizontalContentAlignment="Stretch">
+     <ListView Grid.Row="7" x:Name="ConversationList" AutomationProperties.AutomationId="ConversationList" ItemsSource="{x:Bind Vm.Conversations}" SelectedItem="{x:Bind Vm.SelectedConversation, Mode=TwoWay}" IsEnabled="{x:Bind Vm.CanSelectConversation, Mode=OneWay}" SelectionMode="Single" HorizontalContentAlignment="Stretch">
       <ListView.ItemTemplate><DataTemplate x:DataType="models:Conversation">
        <StackPanel Spacing="3" Padding="2,8">
         <TextBlock Text="{x:Bind Title}" FontWeight="SemiBold" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis"/>
@@ -84,55 +85,146 @@
     <Grid ColumnSpacing="10">
      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
      <TextBlock Text="{x:Bind Vm.SelectedTitle, Mode=OneWay}" Style="{StaticResource SubtitleTextBlockStyle}" TextTrimming="CharacterEllipsis" AutomationProperties.AutomationId="SelectedTitle"/>
-     <Border Grid.Column="1" Background="{ThemeResource ControlFillColorSecondaryBrush}" CornerRadius="4" Padding="8,2" VerticalAlignment="Center">
+     <Border Grid.Column="1" Background="{ThemeResource ControlFillColorSecondaryBrush}" CornerRadius="4" Padding="8,2" VerticalAlignment="Center" Visibility="{x:Bind Vm.ShowConversationMessages, Mode=OneWay}">
       <TextBlock Text="{x:Bind Vm.SelectedConversation.CountLabel, Mode=OneWay}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
      </Border>
     </Grid>
     <StackPanel Grid.Row="1" Spacing="6">
-     <StackPanel Orientation="Horizontal" Spacing="6">
-      <CalendarDatePicker x:Name="StartPicker" AutomationProperties.AutomationId="StartDate" Header="开始日期" PlaceholderText="不限" Date="{x:Bind Vm.StartDate, Mode=TwoWay}" IsEnabled="{x:Bind Vm.CanWork, Mode=OneWay}" Width="148"/>
-      <CalendarDatePicker x:Name="EndPicker" AutomationProperties.AutomationId="EndDate" Header="结束日期（包含）" PlaceholderText="不限" Date="{x:Bind Vm.EndDate, Mode=TwoWay}" IsEnabled="{x:Bind Vm.CanWork, Mode=OneWay}" Width="148"/>
-      <Button Content="应用筛选" Command="{x:Bind Vm.ApplyFiltersCommand}" VerticalAlignment="Bottom" Style="{StaticResource AccentButtonStyle}" AutomationProperties.AutomationId="ApplyFilterButton"/>
-      <Button Content="清除条件" Command="{x:Bind Vm.ClearFiltersCommand}" VerticalAlignment="Bottom" AutomationProperties.AutomationId="ClearFilterButton"/>
+     <StackPanel Orientation="Horizontal" Spacing="8">
+      <TextBlock Text="{x:Bind Vm.BrowseModeLabel, Mode=OneWay}" FontWeight="SemiBold" VerticalAlignment="Center"/>
+      <Button Content="当前会话" Command="{x:Bind Vm.SwitchToConversationCommand}" IsEnabled="{x:Bind Vm.CanSwitchToConversation, Mode=OneWay}"/>
+      <Button Content="全局搜索" Command="{x:Bind Vm.SwitchToGlobalSearchCommand}" IsEnabled="{x:Bind Vm.CanSwitchToGlobalSearch, Mode=OneWay}"/>
      </StackPanel>
-     <Grid ColumnSpacing="6">
-      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-      <TextBox x:Name="MessageSearchBox" Text="{x:Bind Vm.SearchQuery, Mode=TwoWay}" PlaceholderText="搜索消息内容或发送者" IsEnabled="{x:Bind Vm.CanWork, Mode=OneWay}" KeyDown="MessageSearchBox_KeyDown" AutomationProperties.AutomationId="MessageSearch"/>
-      <Button Grid.Column="1" Content="搜索" Command="{x:Bind Vm.ApplyFiltersCommand}" AutomationProperties.AutomationId="SearchMessagesButton"/>
-     </Grid>
-     <TextBlock Text="{x:Bind Vm.RangeLabel, Mode=OneWay}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" AutomationProperties.AutomationId="RangeLabel"/>
+     <TextBlock Text="当前工作进程或数据源不支持全局搜索。" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" Visibility="{x:Bind Vm.IsGlobalSearchUnavailable, Mode=OneWay}"/>
+     <StackPanel Spacing="6" Visibility="{x:Bind Vm.ShowConversationMessages, Mode=OneWay}">
+      <StackPanel Orientation="Horizontal" Spacing="6">
+       <CalendarDatePicker x:Name="StartPicker" AutomationProperties.AutomationId="StartDate" Header="开始日期" PlaceholderText="不限" Date="{x:Bind Vm.StartDate, Mode=TwoWay}" IsEnabled="{x:Bind Vm.CanWork, Mode=OneWay}" Width="148"/>
+       <CalendarDatePicker x:Name="EndPicker" AutomationProperties.AutomationId="EndDate" Header="结束日期（包含）" PlaceholderText="不限" Date="{x:Bind Vm.EndDate, Mode=TwoWay}" IsEnabled="{x:Bind Vm.CanWork, Mode=OneWay}" Width="148"/>
+       <Button Content="应用筛选" Command="{x:Bind Vm.ApplyFiltersCommand}" VerticalAlignment="Bottom" Style="{StaticResource AccentButtonStyle}" AutomationProperties.AutomationId="ApplyFilterButton"/>
+       <Button Content="清除条件" Command="{x:Bind Vm.ClearFiltersCommand}" VerticalAlignment="Bottom" AutomationProperties.AutomationId="ClearFilterButton"/>
+      </StackPanel>
+      <Grid ColumnSpacing="6">
+       <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+       <TextBox x:Name="MessageSearchBox" Text="{x:Bind Vm.SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="搜索消息内容或发送者" IsEnabled="{x:Bind Vm.CanWork, Mode=OneWay}" KeyDown="MessageSearchBox_KeyDown" TextCompositionStarted="SearchBox_CompositionStarted" TextCompositionEnded="SearchBox_CompositionEnded" LostFocus="SearchBox_LostFocus" AutomationProperties.AutomationId="MessageSearch"/>
+       <Button Grid.Column="1" Content="搜索" Command="{x:Bind Vm.ApplyFiltersCommand}" IsEnabled="{x:Bind Vm.CanApplyFilters, Mode=OneWay}" AutomationProperties.AutomationId="SearchMessagesButton"/>
+      </Grid>
+      <TextBlock Text="{x:Bind Vm.RangeLabel, Mode=OneWay}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" AutomationProperties.AutomationId="RangeLabel"/>
+      <TextBlock Text="{x:Bind Vm.MessagePagingStatus, Mode=OneWay}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" AutomationProperties.AutomationId="MessagePagingStatus"/>
+     </StackPanel>
+     <StackPanel Spacing="6" Visibility="{x:Bind Vm.ShowGlobalSearchResults, Mode=OneWay}">
+      <StackPanel Orientation="Horizontal" Spacing="6">
+       <CalendarDatePicker AutomationProperties.AutomationId="GlobalStartDate" Header="开始日期" PlaceholderText="不限" Date="{x:Bind Vm.GlobalStartDate, Mode=TwoWay}" IsEnabled="{x:Bind Vm.CanEditGlobalFilters, Mode=OneWay}" Width="138"/>
+       <CalendarDatePicker AutomationProperties.AutomationId="GlobalEndDate" Header="结束日期（包含）" PlaceholderText="不限" Date="{x:Bind Vm.GlobalEndDate, Mode=TwoWay}" IsEnabled="{x:Bind Vm.CanEditGlobalFilters, Mode=OneWay}" Width="138"/>
+       <ComboBox Header="顺序" SelectedValuePath="Tag" SelectedValue="{x:Bind Vm.GlobalSearchOrder, Mode=TwoWay}" IsEnabled="{x:Bind Vm.CanEditGlobalFilters, Mode=OneWay}" Width="108">
+        <ComboBoxItem Content="最新" Tag="desc"/>
+        <ComboBoxItem Content="最早" Tag="asc"/>
+       </ComboBox>
+       <Button Content="搜索" Command="{x:Bind Vm.ApplyFiltersCommand}" IsEnabled="{x:Bind Vm.CanApplyFilters, Mode=OneWay}" VerticalAlignment="Bottom" Style="{StaticResource AccentButtonStyle}" AutomationProperties.AutomationId="GlobalSearchButton"/>
+       <Button Content="清除" Command="{x:Bind Vm.ClearFiltersCommand}" IsEnabled="{x:Bind Vm.CanClearFilters, Mode=OneWay}" VerticalAlignment="Bottom" AutomationProperties.AutomationId="ClearGlobalSearchButton"/>
+      </StackPanel>
+      <Grid ColumnSpacing="6">
+       <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+       <TextBox x:Name="GlobalSearchBox" Text="{x:Bind Vm.GlobalSearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="搜索所有会话的发送者、正文、类型或已有转写" IsEnabled="{x:Bind Vm.CanEditGlobalFilters, Mode=OneWay}" KeyDown="MessageSearchBox_KeyDown" TextCompositionStarted="SearchBox_CompositionStarted" TextCompositionEnded="SearchBox_CompositionEnded" LostFocus="SearchBox_LostFocus" AutomationProperties.AutomationId="GlobalMessageSearch"/>
+       <Button Grid.Column="1" Content="执行" Command="{x:Bind Vm.ApplyFiltersCommand}" IsEnabled="{x:Bind Vm.CanApplyFilters, Mode=OneWay}"/>
+      </Grid>
+      <TextBlock Text="{x:Bind Vm.GlobalSearchSummary, Mode=OneWay}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap"/>
+      <TextBlock Text="{x:Bind Vm.GlobalAppliedFiltersLabel, Mode=OneWay}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis"/>
+      <TextBlock Text="{x:Bind Vm.GlobalSearchStatus, Mode=OneWay}" FontSize="11" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" TextWrapping="Wrap"/>
+      <TextBlock Text="{x:Bind Vm.GlobalCoverageNotice, Mode=OneWay}" FontSize="11" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" TextWrapping="Wrap"/>
+     </StackPanel>
+     <StackPanel Spacing="6" Visibility="{x:Bind Vm.ShowMessageContext, Mode=OneWay}">
+      <StackPanel Orientation="Horizontal" Spacing="6">
+       <Button Content="返回全局搜索结果" Click="ReturnToSearch_Click" IsEnabled="{x:Bind Vm.CanReturnToSearch, Mode=OneWay}" AutomationProperties.AutomationId="ReturnToGlobalSearch"/>
+       <Button Content="在此会话中浏览" Command="{x:Bind Vm.BrowseContextConversationCommand}" IsEnabled="{x:Bind Vm.CanBrowseContextConversation, Mode=OneWay}" AutomationProperties.AutomationId="BrowseContextConversation"/>
+       <TextBlock Text="{x:Bind Vm.ContextSummary, Mode=OneWay}" VerticalAlignment="Center" FontSize="11"/>
+      </StackPanel>
+      <TextBlock Text="{x:Bind Vm.ContextCoverageNotice, Mode=OneWay}" FontSize="11" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" TextWrapping="Wrap"/>
+     </StackPanel>
     </StackPanel>
     <Border Grid.Row="2" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8">
      <Grid>
-      <ListView x:Name="MessageList" AutomationProperties.AutomationId="MessageList" ItemsSource="{x:Bind Vm.Messages}" SelectionMode="None" HorizontalContentAlignment="Stretch">
+      <ListView x:Name="MessageList" AutomationProperties.AutomationId="MessageList" ItemsSource="{x:Bind Vm.Messages}" SelectionMode="None" HorizontalContentAlignment="Stretch" Visibility="{x:Bind Vm.ShowConversationMessages, Mode=OneWay}">
        <ListView.ItemsPanel><ItemsPanelTemplate><ItemsStackPanel/></ItemsPanelTemplate></ListView.ItemsPanel>
        <ListView.ItemTemplate><DataTemplate x:DataType="models:ChatMessage">
         <Grid Padding="14,10" RowSpacing="5">
-         <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+         <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
          <StackPanel Orientation="Horizontal" Spacing="8">
           <TextBlock Text="{x:Bind Sender}" FontWeight="SemiBold"/>
           <Border Background="{ThemeResource ControlFillColorSecondaryBrush}" CornerRadius="4" Padding="6,0" VerticalAlignment="Center">
            <TextBlock Text="{x:Bind KindLabel}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
           </Border>
           <TextBlock Text="{x:Bind TimeLabel}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" VerticalAlignment="Center"/>
+          <TextBlock Text="{x:Bind FocusLabel}" FontSize="11" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" VerticalAlignment="Center"/>
          </StackPanel>
          <TextBlock Grid.Row="1" Text="{x:Bind Content}" TextWrapping="Wrap" IsTextSelectionEnabled="True"/>
          <TextBlock Grid.Row="2" Text="{x:Bind Transcript}" TextWrapping="Wrap" FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="{x:Bind HasTranscript}"/>
          <Button Grid.Row="3" Content="{x:Bind AttachmentLabel}" Click="OpenAttachment_Click" HorizontalAlignment="Left" Padding="8,2" FontSize="12" Visibility="{x:Bind HasAttachment}"/>
+         <local:MessageCardView Grid.Row="4" CardProjection="{x:Bind}"/>
+        </Grid>
+       </DataTemplate></ListView.ItemTemplate>
+      </ListView>
+      <ListView x:Name="GlobalSearchList" AutomationProperties.AutomationId="GlobalSearchResults" ItemsSource="{x:Bind Vm.GlobalSearchHits}" SelectionMode="None" HorizontalContentAlignment="Stretch" IsEnabled="{x:Bind Vm.CanNavigateGlobalHits, Mode=OneWay}" Visibility="{x:Bind Vm.ShowGlobalSearchResults, Mode=OneWay}">
+       <ListView.ItemsPanel><ItemsPanelTemplate><ItemsStackPanel/></ItemsPanelTemplate></ListView.ItemsPanel>
+       <ListView.ItemTemplate><DataTemplate x:DataType="models:GlobalSearchHit">
+        <StackPanel Spacing="5" Margin="6,4">
+         <!-- Keep expandable card controls outside the locator button. Expanding
+              with the mouse or Enter/Space must never open a context request. -->
+         <Button Click="GlobalHit_Click" HorizontalContentAlignment="Stretch" HorizontalAlignment="Stretch" Padding="12,9" AutomationProperties.AutomationId="OpenGlobalHitButton">
+          <StackPanel Spacing="5">
+           <TextBlock Text="{x:Bind ConversationTitle}" FontWeight="SemiBold" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis"/>
+           <StackPanel Orientation="Horizontal" Spacing="8">
+            <TextBlock Text="{x:Bind Sender}" MaxWidth="160" TextTrimming="CharacterEllipsis"/>
+            <TextBlock Text="{x:Bind KindLabel}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+            <TextBlock Text="{x:Bind TimeLabel}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+           </StackPanel>
+           <TextBlock Text="{x:Bind Snippet}" TextWrapping="Wrap" IsTextSelectionEnabled="True"/>
+           <TextBlock Text="{x:Bind MatchedFieldsLabel}" FontSize="11" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"/>
+          </StackPanel>
+         </Button>
+         <local:MessageCardView CardProjection="{x:Bind}" Margin="12,0"/>
+        </StackPanel>
+       </DataTemplate></ListView.ItemTemplate>
+      </ListView>
+      <ListView x:Name="ContextMessageList" AutomationProperties.AutomationId="MessageContext" ItemsSource="{x:Bind Vm.ContextMessages}" SelectionMode="None" HorizontalContentAlignment="Stretch" Visibility="{x:Bind Vm.ShowMessageContext, Mode=OneWay}">
+       <ListView.ItemsPanel><ItemsPanelTemplate><ItemsStackPanel/></ItemsPanelTemplate></ListView.ItemsPanel>
+       <ListView.ItemTemplate><DataTemplate x:DataType="models:ChatMessage">
+        <Grid Padding="14,10" RowSpacing="5">
+         <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+         <StackPanel Orientation="Horizontal" Spacing="8">
+          <TextBlock Text="{x:Bind Sender}" FontWeight="SemiBold"/>
+          <TextBlock Text="{x:Bind KindLabel}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+          <TextBlock Text="{x:Bind TimeLabel}" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+          <TextBlock Text="{x:Bind FocusLabel}" FontSize="11" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"/>
+         </StackPanel>
+         <TextBlock Grid.Row="1" Text="{x:Bind Content}" TextWrapping="Wrap" IsTextSelectionEnabled="True"/>
+         <TextBlock Grid.Row="2" Text="{x:Bind Transcript}" TextWrapping="Wrap" FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="{x:Bind HasTranscript}"/>
+         <local:MessageCardView Grid.Row="3" CardProjection="{x:Bind}"/>
         </Grid>
        </DataTemplate></ListView.ItemTemplate>
       </ListView>
       <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="6" Visibility="{x:Bind Vm.IsEmpty, Mode=OneWay}" Margin="24">
        <FontIcon Glyph="&#xE8BD;" FontSize="28" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
-       <TextBlock Text="没有可显示的消息" FontWeight="SemiBold" HorizontalAlignment="Center"/>
-       <TextBlock Text="选择会话，或调整日期与关键词。" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" TextAlignment="Center"/>
+       <TextBlock Text="{x:Bind Vm.EmptyTitle, Mode=OneWay}" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+       <TextBlock Text="{x:Bind Vm.EmptyDescription, Mode=OneWay}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" TextAlignment="Center"/>
       </StackPanel>
      </Grid>
     </Border>
     <Grid Grid.Row="3" ColumnSpacing="8">
      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-     <TextBlock Text="{x:Bind Vm.MessageSummary, Mode=OneWay}" AutomationProperties.AutomationId="MessageSummary" TextWrapping="Wrap" VerticalAlignment="Center" FontSize="12"/>
-     <Button Grid.Column="1" Content="加载更多" AutomationProperties.AutomationId="LoadMoreButton" Command="{x:Bind Vm.LoadMoreCommand}"/>
+     <TextBlock Text="{x:Bind Vm.MessageSummary, Mode=OneWay}" AutomationProperties.AutomationId="MessageSummary" TextWrapping="Wrap" VerticalAlignment="Center" FontSize="12" Visibility="{x:Bind Vm.ShowConversationMessages, Mode=OneWay}"/>
+     <StackPanel Grid.Column="1" Spacing="6" Visibility="{x:Bind Vm.ShowConversationMessages, Mode=OneWay}">
+      <StackPanel Orientation="Horizontal" Spacing="6" Visibility="{x:Bind Vm.ShowCursorMessageNavigation, Mode=OneWay}">
+       <Button Content="上一批" AutomationProperties.AutomationId="PreviousMessageBatchButton" Click="MessageBatch_Click" Tag="previous" IsEnabled="{x:Bind Vm.CanLoadPreviousMessageBatch, Mode=OneWay}" ToolTipService.ToolTip="读取前面最多 50 条，超出窗口时释放另一端"/>
+       <Button Content="下一批" AutomationProperties.AutomationId="NextMessageBatchButton" Click="MessageBatch_Click" Tag="next" IsEnabled="{x:Bind Vm.CanLoadNextMessageBatch, Mode=OneWay}" ToolTipService.ToolTip="读取后面最多 50 条，超出窗口时释放另一端"/>
+      </StackPanel>
+      <StackPanel Orientation="Horizontal" Spacing="6">
+       <Button Content="加载更多" AutomationProperties.AutomationId="LoadMoreButton" Command="{x:Bind Vm.LoadMoreCommand}" IsEnabled="{x:Bind Vm.CanLoadMore, Mode=OneWay}" Visibility="{x:Bind Vm.ShowLegacyMessageNavigation, Mode=OneWay}"/>
+       <Button Content="刷新首屏" AutomationProperties.AutomationId="RefreshMessagesButton" Click="MessageBatch_Click" Tag="refresh" IsEnabled="{x:Bind Vm.CanRefreshMessages, Mode=OneWay}"/>
+      </StackPanel>
+     </StackPanel>
+     <TextBlock Text="{x:Bind Vm.GlobalSearchSummary, Mode=OneWay}" TextWrapping="Wrap" VerticalAlignment="Center" FontSize="12" Visibility="{x:Bind Vm.ShowGlobalSearchResults, Mode=OneWay}"/>
+     <Button Grid.Column="1" Content="加载下一页" AutomationProperties.AutomationId="LoadMoreGlobalButton" Command="{x:Bind Vm.LoadMoreGlobalCommand}" IsEnabled="{x:Bind Vm.CanLoadMoreGlobal, Mode=OneWay}" Visibility="{x:Bind Vm.ShowGlobalSearchResults, Mode=OneWay}"/>
+     <TextBlock Text="{x:Bind Vm.ContextSummary, Mode=OneWay}" TextWrapping="Wrap" VerticalAlignment="Center" FontSize="12" Visibility="{x:Bind Vm.ShowMessageContext, Mode=OneWay}"/>
     </Grid>
    </Grid>
 

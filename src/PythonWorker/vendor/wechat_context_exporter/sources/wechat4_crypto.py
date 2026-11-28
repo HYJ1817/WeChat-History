@@ -177,6 +177,19 @@ def _apply_encrypted_wal(wal_path: Path, destination: Path, encryption_key: byte
         plain.truncate(last_commit_size * PAGE_SIZE)
 
 
+@dataclass(frozen=True, slots=True)
+class DatabaseSnapshot:
+    """A successful controlled copy plus its source DB/WAL version.
+
+    This detects normal file updates, not adversarial timestamp-preserving
+    mutation. Paths stay internal to the worker and are never protocol IDs.
+    """
+
+    path: Path
+    generation: int
+    signature: tuple[int, int, int, int]
+
+
 class DecryptedDatabaseCache:
     def __init__(
         self,
@@ -199,6 +212,29 @@ class DecryptedDatabaseCache:
         self._encrypted_root = self._root / "encrypted"
         self._decrypted_root = self._root / "decrypted"
         self._cache: dict[str, tuple[tuple[int, int, int, int], Path]] = {}
+        self._snapshot_signatures: dict[str, tuple[int, int, int, int]] = {}
+        self._generations: dict[str, int] = {}
+        self._next_generation = 0
+
+    def get_snapshot(self, relative_path: str) -> DatabaseSnapshot:
+        normalized = relative_path.replace("/", "\\")
+        path = self.get(normalized)
+        signature, _ = self._cache[normalized]
+        return DatabaseSnapshot(path, self._generations[normalized], signature)
+
+    def is_snapshot_current(self, relative_path: str, snapshot: DatabaseSnapshot) -> bool:
+        normalized = relative_path.replace("/", "\\")
+        source = self.db_dir / Path(normalized.replace("\\", os.sep))
+        try:
+            return (
+                safe_is_file(snapshot.path)
+                and self._generations.get(normalized) == snapshot.generation
+                and normalized in self._cache
+                and self._cache[normalized][0] == snapshot.signature
+                and _database_signature(source) == snapshot.signature
+            )
+        except OSError:
+            return False
 
     def get(self, relative_path: str) -> Path:
         normalized = relative_path.replace("/", "\\")
@@ -212,6 +248,9 @@ class DecryptedDatabaseCache:
             # removed the plaintext copy; decrypt it again instead of handing
             # SQLite a missing path.
             self._cache.pop(normalized, None)
+            # A failed refresh must not leave the old generation validating a
+            # partially re-created plaintext file at the same cache path.
+            self._generations.pop(normalized, None)
         key = self.keys.get(normalized)
         if key is None and self.raw_key is not None:
             with source.open("rb") as stream:
@@ -222,7 +261,12 @@ class DecryptedDatabaseCache:
         snapshot = self._snapshot_database(source, normalized)
         destination = self._decrypted_root / normalized.replace("\\", "_")
         decrypt_database(snapshot, destination, key)
-        self._cache[normalized] = (signature, destination)
+        # Record the signature of the copy that actually succeeded, not the
+        # earlier cache probe (the live WAL can advance while copying).
+        copied_signature = self._snapshot_signatures[normalized]
+        self._cache[normalized] = (copied_signature, destination)
+        self._next_generation += 1
+        self._generations[normalized] = self._next_generation
         return destination
 
     def _snapshot_database(self, source: Path, normalized: str) -> Path:
@@ -243,12 +287,15 @@ class DecryptedDatabaseCache:
                 time.sleep(0.1)
                 continue
             if before == after:
+                self._snapshot_signatures[normalized] = after
                 return snapshot
             time.sleep(0.1)
         raise SourceError(f"WeChat database changed repeatedly while being copied: {normalized}")
 
     def close(self) -> None:
         self._cache.clear()
+        self._snapshot_signatures.clear()
+        self._generations.clear()
         self._temp.cleanup()
 
 

@@ -17,6 +17,10 @@ public sealed partial class MainWindow : Window
 {
     public MainViewModel Vm { get; }
     private bool _loaded, _allowClose, _closeInProgress;
+    private readonly SearchEnterGuard _searchEnterGuard = new();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern short GetKeyState(int virtualKey);
     private const int DwmwaUseImmersiveDarkMode = 20;
     private const int DwmwaUseImmersiveDarkModeBefore20H1 = 19;
 
@@ -30,6 +34,10 @@ public sealed partial class MainWindow : Window
     {
         Vm = new MainViewModel(DispatcherQueue);
         InitializeComponent();
+        // TextBox/IME class handlers may consume KeyUp. Always release the Enter
+        // latch, including when the composition commit's routed event is handled.
+        MessageSearchBox.AddHandler(UIElement.KeyUpEvent, new Microsoft.UI.Xaml.Input.KeyEventHandler(SearchBox_KeyUp), true);
+        GlobalSearchBox.AddHandler(UIElement.KeyUpEvent, new Microsoft.UI.Xaml.Input.KeyEventHandler(SearchBox_KeyUp), true);
         Title = "微信记忆";
         AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "app.ico"));
         ExtendsContentIntoTitleBar = true;
@@ -174,9 +182,81 @@ public sealed partial class MainWindow : Window
 
     private async void MessageSearchBox_KeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs e)
     {
-        if (e.Key != Windows.System.VirtualKey.Enter || !Vm.ApplyFiltersCommand.CanExecute(null)) return;
+        // IMEs use Enter to commit the current composition/candidate. Do not turn
+        // that keystroke into a search; only an ordinary Enter executes filters.
+        if (e.Key != Windows.System.VirtualKey.Enter || !_searchEnterGuard.TryExecuteEnter()) return;
+        // Commit the visible text explicitly before CanExecute, even if the binding
+        // has not yet delivered its TwoWay update for this keystroke.
+        if (sender is TextBox box)
+        {
+            if (ReferenceEquals(box, GlobalSearchBox)) Vm.GlobalSearchQuery = box.Text;
+            else Vm.SearchQuery = box.Text;
+        }
+        if (!Vm.ApplyFiltersCommand.CanExecute(null)) return;
         e.Handled = true;
         await Vm.ApplyFiltersCommand.ExecuteAsync(null);
+    }
+
+    private void SearchBox_KeyUp(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs e)
+    {
+        if (e.Key == VirtualKey.Enter) _searchEnterGuard.EnterReleased();
+    }
+
+    private void SearchBox_CompositionStarted(object sender, TextCompositionStartedEventArgs e) => _searchEnterGuard.CompositionStarted();
+    private void SearchBox_CompositionEnded(object sender, TextCompositionEndedEventArgs e) =>
+        _searchEnterGuard.CompositionEnded((GetKeyState((int)VirtualKey.Enter) & 0x8000) != 0);
+    private void SearchBox_LostFocus(object sender, RoutedEventArgs e) => _searchEnterGuard.Reset();
+
+    private async void GlobalHit_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement { DataContext: GlobalSearchHit hit }) return;
+        double returnOffset = FindScrollViewer(GlobalSearchList)?.VerticalOffset ?? 0;
+        if (!await Vm.OpenGlobalHitAsync(hit, returnOffset)) return;
+        ContextMessageList.UpdateLayout();
+        int focusIndex = Vm.ContextFocusIndex;
+        if (focusIndex >= 0 && focusIndex < Vm.ContextMessages.Count)
+            ContextMessageList.ScrollIntoView(Vm.ContextMessages[focusIndex]);
+    }
+
+    private async void MessageBatch_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement { Tag: string direction }) return;
+        var command = direction switch
+        {
+            "previous" => Vm.PreviousMessageBatchCommand,
+            "next" => Vm.NextMessageBatchCommand,
+            _ => Vm.RefreshMessagesCommand,
+        };
+        if (!command.CanExecute(null)) return;
+        long version = Vm.MessageWindowVersion;
+        await command.ExecuteAsync(null);
+        // A failed/late response must not jump the unchanged window's scroll.
+        if (Vm.MessageWindowVersion == version || !Vm.ShowCursorMessageNavigation) return;
+        int index = Vm.MessageBatchFocusIndex;
+        MessageList.UpdateLayout();
+        if (index >= 0 && index < Vm.Messages.Count)
+            MessageList.ScrollIntoView(Vm.Messages[index], ScrollIntoViewAlignment.Leading);
+    }
+
+    private async void ReturnToSearch_Click(object sender, RoutedEventArgs e)
+    {
+        await Vm.ReturnToSearchCommand.ExecuteAsync(null);
+        GlobalSearchList.UpdateLayout();
+        var scrollViewer = FindScrollViewer(GlobalSearchList);
+        if (scrollViewer is not null)
+            scrollViewer.ChangeView(null, Vm.GlobalReturnScrollOffset, null, disableAnimation: true);
+    }
+
+    private static ScrollViewer? FindScrollViewer(DependencyObject root)
+    {
+        int count = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(root);
+        for (int index = 0; index < count; index++)
+        {
+            var child = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(root, index);
+            if (child is ScrollViewer scrollViewer) return scrollViewer;
+            if (FindScrollViewer(child) is { } nested) return nested;
+        }
+        return null;
     }
 
     private async void ChooseTargetFolder_Click(object sender, RoutedEventArgs e)

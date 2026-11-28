@@ -110,7 +110,7 @@ function Test-Alive([int]$processId) {
 try {
     $report.stage = 'launch'
     $demoPath = Join-Path $root 'demo/conversations.json'
-    $app = Start-Process -FilePath $report.executable -ArgumentList @('--demo', $demoPath) -PassThru
+    $app = Start-Process -FilePath $report.executable -ArgumentList @('--demo', ('"{0}"' -f $demoPath)) -PassThru
     $handle = Wait-Until { $app.Refresh(); if ($app.HasExited) { throw "App exited early: $($app.ExitCode)" }; if ($app.MainWindowHandle -ne [IntPtr]::Zero) { $app.MainWindowHandle } } 30 'native window'
     [NativeFlowCapture]::SetForegroundWindow($handle) | Out-Null
     Start-Sleep -Seconds 2
