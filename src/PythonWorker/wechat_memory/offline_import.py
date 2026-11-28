@@ -13,6 +13,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .memory_paging import ImmutableMessagePageProvider
+from .page_sessions import PageSessionError, PageSessionLimits
+
 UTC8 = timezone(timedelta(hours=8))
 MAX_JSON_BYTES = 64 * 1024 * 1024
 MAX_CONVERSATIONS = 10_000
@@ -270,3 +273,30 @@ def load_json_file(path: str | Path, *, allow_naive_timestamps: bool = True) -> 
     )
     schema = "wechat-memory-json-v1" if "notice" not in payload else "demo-json-v1"
     return ImportedJson(conversations, schema, total[0])
+
+
+class OfflineJsonPageProvider(ImmutableMessagePageProvider[JsonMessage]):
+    """Page the exact import using the same immutable slicer as demo.
+
+    The host creates this adapter once for its current ``ImportedJson``. Call
+    ``replace_snapshot`` after successful re-import and ``invalidate`` on source
+    switch. Sessions retain only metadata, never the previous dataset.
+    """
+
+    def __init__(self, snapshot: ImportedJson, *, limits: PageSessionLimits | None = None) -> None:
+        if not isinstance(snapshot, ImportedJson):
+            raise TypeError("snapshot must be an ImportedJson instance")
+        super().__init__(snapshot.conversations, limits=limits)
+        self._snapshot = snapshot
+
+    @property
+    def snapshot(self) -> ImportedJson:
+        """The exact active import, not a second materialized dataset."""
+        return self._snapshot
+
+    def replace_snapshot(self, snapshot: ImportedJson) -> None:
+        """Activate a successful re-import; old valid tokens report changed."""
+        if not isinstance(snapshot, ImportedJson):
+            raise TypeError("snapshot must be an ImportedJson instance")
+        self._replace_conversations(snapshot.conversations)
+        self._snapshot = snapshot

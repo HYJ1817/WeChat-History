@@ -6,7 +6,7 @@ namespace WechatMemory.NativeApp.Services;
 
 // One dedicated child, one outstanding request, two independently drained pipes.
 // This file is UI-independent and compiled directly into NativeApp.Tests.
-public sealed class WorkerClient : IAsyncDisposable
+public sealed class WorkerClient : IAsyncDisposable, IWorkerRequestClient
 {
     private readonly Process _process;
     private readonly SemaphoreSlim _serial = new(1, 1);

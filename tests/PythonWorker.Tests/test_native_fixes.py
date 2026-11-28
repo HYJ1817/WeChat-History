@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -208,6 +209,36 @@ class EmptyMarkdownTests(unittest.TestCase):
             self.assertNotIn("\n# 注入", text)
             self.assertIn("\\# 注入", text)
             self.assertIn("（所选日期范围内没有消息。）", text)
+
+
+class LiveMarkdownIntegrationTests(unittest.TestCase):
+    def test_live_export_uses_canonical_file_renderer_without_changing_attachment_label(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wechat-live-md-") as temp:
+            output = Path(temp) / "chat.md"
+            conversation = Conversation("live", "合成会话", ConversationKind.DIRECT)
+            messages = [
+                Message(
+                    "file", conversation.id, "发送者", datetime(2026, 11, 28, 9, tzinfo=timezone.utc),
+                    MessageType.FILE, r"C:\synthetic\报告`[1].pdf",
+                ),
+                Message(
+                    "card", conversation.id, "发送者", datetime(2026, 11, 28, 9, 1, tzinfo=timezone.utc),
+                    MessageType.FILE,
+                    "[链接] **链接标题**\n第一行\n\n# 不是标题\nURL: https://a.invalid/path?a=1&b=2",
+                ),
+            ]
+            with mock.patch.object(
+                worker, "export_markdown", side_effect=AssertionError("vendor Markdown exporter used")
+            ):
+                worker._write_models_atomic(conversation, messages, output, overwrite=False)
+            raw = output.read_text(encoding="utf-8")
+
+        self.assertIn("_[文件]", raw)
+        self.assertIn("报告", raw)
+        self.assertNotIn("File attachment:", raw)
+        self.assertIn("\\*\\*链接标题\\*\\*", raw)
+        self.assertIn("第一行  \n  \n\\# 不是标题", raw)
+        self.assertNotIn("](https", raw)
 
 
 class DisplayDateTests(unittest.TestCase):

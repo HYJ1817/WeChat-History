@@ -2,7 +2,6 @@ using System.Collections.ObjectModel;
 using System.Text.Json;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
-using Microsoft.UI.Dispatching;
 using WechatMemory.NativeApp.Models;
 using WechatMemory.NativeApp.Services;
 
@@ -10,12 +9,15 @@ namespace WechatMemory.NativeApp.ViewModels;
 
 public partial class MainViewModel : ObservableObject, IAsyncDisposable
 {
-    private readonly DispatcherQueue _dispatcher;
+    private readonly Action<Action> _enqueue;
+    private readonly Func<WorkerClient> _startWorker;
+    private readonly Action<string, string> _log;
     private readonly bool _demoMode;
     private bool _offlineMode;
     private string? _offlinePath;
     private WorkerClient? _worker;
     private int? _nextOffset;
+    private string? _messageConversationId;
     private DateRange _applied = new(null, null);
     private readonly Dictionary<string, string> _accountNames = new(StringComparer.Ordinal);
     private readonly OperationGate _operationGate = new();
@@ -23,9 +25,19 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
     private bool _pruneWorkflowActive;
     private bool _closing;
     private bool _suppressSceneDates;
+    private bool _suppressConversationAutoFetch;
+    private bool _suppressConversationReset;
     private ConnectionMedia? _connectedMedia;
+    private readonly HashSet<string> _workerCapabilities = new(StringComparer.Ordinal);
+    private readonly GlobalSearchWorkflow _globalSearchWorkflow = new();
+    private readonly GlobalSearchSessionState _globalSearchState = new();
+    private long _sourceEpoch;
+    private double _globalReturnScrollOffset;
+    private Conversation? _preContextConversation;
     public ObservableCollection<Conversation> Conversations { get; } = [];
     public ObservableCollection<ChatMessage> Messages { get; } = [];
+    public ObservableCollection<GlobalSearchHit> GlobalSearchHits { get; } = [];
+    public ObservableCollection<ChatMessage> ContextMessages { get; } = [];
     public ObservableCollection<AccountItem> Accounts { get; } = [];
     public ObservableCollection<SceneItem> Scenes { get; } = [];
     public ObservableCollection<JobSummary> Jobs { get; } = [];
@@ -36,6 +48,14 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
     [ObservableProperty] public partial DateTimeOffset? StartDate { get; set; }
     [ObservableProperty] public partial DateTimeOffset? EndDate { get; set; }
     [ObservableProperty] public partial string SearchQuery { get; set; } = "";
+    [ObservableProperty] public partial string GlobalSearchQuery { get; set; } = "";
+    [ObservableProperty] public partial DateTimeOffset? GlobalStartDate { get; set; }
+    [ObservableProperty] public partial DateTimeOffset? GlobalEndDate { get; set; }
+    [ObservableProperty] public partial string GlobalSearchOrder { get; set; } = "desc";
+    [ObservableProperty] public partial bool IsGlobalSearchMode { get; private set; }
+    [ObservableProperty] public partial bool IsContextMode { get; private set; }
+    [ObservableProperty] public partial string ContextSummary { get; set; } = "";
+    [ObservableProperty] public partial string ContextCoverageNotice { get; set; } = "";
     [ObservableProperty] public partial string ConversationQuery { get; set; } = "";
     [ObservableProperty] public partial bool IsBusy { get; set; }
     [ObservableProperty] public partial bool IsConnected { get; set; }
@@ -67,20 +87,62 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
 
     public IReadOnlyList<int> PruneRetentionDayOptions { get; } = [30, 90, 180, 365];
     public bool CanStartOperation => _operationGate.CanStart(IsBusy, _closing);
-    public bool CanWork => _operationGate.CanStart(IsBusy, _closing) && IsConnected;
+    public bool CanWork => _operationGate.CanStart(IsBusy, _closing) && IsConnected && _worker?.IsAvailable == true;
     public bool CanManageJobs => _operationGate.CanManageJobs(IsBusy, _closing, _worker?.IsAvailable == true);
-    public bool CanExport => _operationGate.CanExport(IsBusy, _closing, IsConnected, SelectedConversation is not null, !FiltersDirty);
-    public bool CanLoadMore => CanExport && _nextOffset is not null;
+    public bool HasGlobalSearchCapability => _workerCapabilities.Contains("global_message_search") && _workerCapabilities.Contains("message_context");
+    public string? SourceSessionId => _globalSearchState.SourceSessionId;
+    public bool CanUseGlobalSearch => CanWork && HasGlobalSearchCapability && !string.IsNullOrWhiteSpace(SourceSessionId);
+    public bool IsGlobalSearchUnavailable => IsConnected && !IsBusy && !CanUseGlobalSearch;
+    public bool CanSwitchToGlobalSearch => CanUseGlobalSearch && !IsGlobalSearchMode;
+    public bool CanSwitchToConversation => CanWork && IsGlobalSearchMode && !IsContextMode;
+    public bool CanEditGlobalFilters => CanUseGlobalSearch && IsGlobalSearchMode && !IsContextMode;
+    public bool CanApplyFilters => CanWork && (IsGlobalSearchMode
+        ? CanUseGlobalSearch && !IsContextMode && !string.IsNullOrWhiteSpace(GlobalSearchQuery)
+        : SelectedConversation is not null && (SearchQuery.Length == 0 || !string.IsNullOrWhiteSpace(SearchQuery)));
+    public bool CanClearFilters => CanWork && (IsGlobalSearchMode
+        ? CanUseGlobalSearch && !IsContextMode
+        : SelectedConversation is not null);
+    public bool CanExport => _operationGate.CanExport(IsBusy, _closing, IsConnected,
+        SelectedConversation is not null, !FiltersDirty) && _worker?.IsAvailable == true && !IsGlobalSearchMode && !IsContextMode;
+    public bool CanLoadMore => CanExport && !IsGlobalSearchMode && _messagePageWindow is null && _nextOffset is not null;
+    public bool CanLoadMoreGlobal => CanUseGlobalSearch && IsGlobalSearchMode && !IsContextMode && _globalSearchState.CanContinue;
+    public bool CanNavigateGlobalHits => CanUseGlobalSearch && IsGlobalSearchMode && !IsContextMode && _globalSearchState.CanNavigate;
     public bool HasError => Error.Length > 0;
     public bool HasResult => ResultPath.Length > 0;
     public bool HasResultSummary => ResultSummary.Length > 0;
-    public bool IsEmpty => !IsBusy && Messages.Count == 0;
-    public string SelectedTitle => SelectedConversation?.Title ?? "消息预览";
+    public bool IsEmpty => !IsBusy && (IsContextMode ? ContextMessages.Count == 0 :
+        IsGlobalSearchMode ? GlobalSearchHits.Count == 0 : Messages.Count == 0);
+    public bool ShowConversationMessages => !IsGlobalSearchMode && !IsContextMode;
+    public bool ShowGlobalSearchResults => IsGlobalSearchMode && !IsContextMode;
+    public bool ShowMessageContext => IsContextMode;
+    public string EmptyTitle => IsContextMode ? "没有可显示的上下文" :
+        IsGlobalSearchMode ? _globalSearchState.Snapshot is null ? "尚无搜索结果" : "没有符合条件的消息" : "没有可显示的消息";
+    public string EmptyDescription => IsContextMode ? "返回搜索结果，或在目标会话中浏览。" :
+        IsGlobalSearchMode ? GlobalSearchDirty ? "搜索条件已修改；请重新执行后再翻页或定位。" :
+            _globalSearchState.Snapshot is null ? "输入关键词并执行全局搜索。" : "尝试其他关键词或日期范围。" :
+        "选择会话，或调整日期与关键词。";
+    public int ContextFocusIndex => ContextMessages.Select((message, index) => (message, index))
+        .Where(entry => entry.message.IsContextFocus).Select(entry => entry.index).DefaultIfEmpty(-1).First();
+    public string SelectedTitle => IsContextMode ? ContextConversation?.Title ?? "消息上下文" :
+        IsGlobalSearchMode ? "全局搜索结果" : SelectedConversation?.Title ?? "消息预览";
+    public string BrowseModeLabel => IsContextMode ? "消息上下文" : IsGlobalSearchMode ? "全局搜索" : "当前会话";
+    public string GlobalSearchSummary => _globalSearchState.Snapshot is { } snapshot
+        ? $"已载入 {snapshot.Items.Count:N0} 条。{snapshot.Summary}" : "输入关键词后执行全局搜索。";
+    public string GlobalAppliedFiltersLabel => _globalSearchState.AppliedCriteria is { } criteria
+        ? $"已应用：{criteria.Query} · {criteria.StartDate ?? "不限"} 至 {criteria.EndDate ?? "不限"}（包含，UTC+08:00）· {(criteria.Order == "asc" ? "最早" : "最新")}" : "";
+    public string GlobalSearchStatus => _globalSearchState.IsInvalidated ? _globalSearchState.InvalidationNotice :
+        GlobalSearchDirty ? "搜索条件已修改；现有结果仅供参考。重新执行后才能继续翻页或定位。" : "";
+    public string GlobalCoverageNotice => _globalSearchState.Snapshot?.CoverageNotice ?? "";
+    public bool CanSelectConversation => CanWork && !IsContextMode;
+    public Conversation? ContextConversation { get; private set; }
+    public double GlobalReturnScrollOffset => _globalReturnScrollOffset;
+    public bool CanReturnToSearch => IsGlobalSearchMode && IsContextMode && CanWork;
+    public bool CanBrowseContextConversation => IsGlobalSearchMode && IsContextMode && CanWork;
     public bool CanConnect => _operationGate.CanReconnect(IsBusy, _closing);
     public bool CanConnectWechat => _operationGate.CanConnectWechat(IsBusy, _closing, IsConnected, Accounts.Count > 0);
     public bool CanImportJson => _operationGate.CanImportJson(IsBusy, _closing, _worker?.IsAvailable == true);
     public bool CanTranscribe => CanWork && !_offlineMode && SelectedConversation is not null && EnableVoice && !FiltersDirty
-        && (_demoMode || _connectedMedia?.VoiceReady == true);
+        && !IsGlobalSearchMode && !IsContextMode && (_demoMode || _connectedMedia?.VoiceReady == true);
     public bool IsWechatMode => !_demoMode && !_offlineMode;
     public bool IsOfflineMode => _offlineMode;
     public bool IsDemoMode => _demoMode;
@@ -97,9 +159,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
     public bool CanSaveScene => CanWork && CustomSceneName.Trim().Length > 0 && CustomScenePrompt.Trim().Length > 0;
     public bool CanDeleteScene => _operationGate.CanDeleteScene(IsBusy, _closing, SelectedScene is { Builtin: false });
     public bool HasJobs => Jobs.Count > 0;
-    public bool CanExportJob => _operationGate.CanExport(
-        IsBusy, _closing, IsConnected, SelectedConversation is not null, !FiltersDirty) &&
-        (ExportMarkdown || ExportJson || ExportPdf);
+    public bool CanExportJob => CanExport && (ExportMarkdown || ExportJson || ExportPdf);
 
     public IAsyncRelayCommand ReconnectCommand { get; }
     public IAsyncRelayCommand ConnectWechatCommand { get; }
@@ -109,6 +169,11 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
     public IAsyncRelayCommand ApplyFiltersCommand { get; }
     public IAsyncRelayCommand ClearFiltersCommand { get; }
     public IAsyncRelayCommand LoadMoreCommand { get; }
+    public IAsyncRelayCommand LoadMoreGlobalCommand { get; }
+    public IRelayCommand SwitchToGlobalSearchCommand { get; }
+    public IAsyncRelayCommand SwitchToConversationCommand { get; }
+    public IAsyncRelayCommand ReturnToSearchCommand { get; }
+    public IAsyncRelayCommand BrowseContextConversationCommand { get; }
     public IAsyncRelayCommand ExportJobCommand { get; }
     public IAsyncRelayCommand SaveSceneCommand { get; }
     public IAsyncRelayCommand DeleteSceneCommand { get; }
@@ -117,23 +182,34 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
     public IAsyncRelayCommand RefreshVoiceCommand { get; }
     public IAsyncRelayCommand PrepareVoiceCommand { get; }
 
-    public MainViewModel(DispatcherQueue dispatcher)
+    // The platform adapter supplies dispatch/startup. Tests exercise these exact
+    // production commands and state transitions through an isolated worker pipe.
+    internal MainViewModel(Action<Action> enqueue, Func<WorkerClient> startWorker, bool demoMode,
+        Action<string, string>? log = null)
     {
-        _dispatcher = dispatcher;
-        _demoMode = StartupOptions.DemoMode;
+        _enqueue = enqueue;
+        _startWorker = startWorker;
+        _log = log ?? ((name, code) => AppLog.Write(name, code));
+        _demoMode = demoMode;
         UseWechat = !_demoMode;
         ReconnectCommand = new AsyncRelayCommand(InitializeAsync, () => CanConnect);
         ConnectWechatCommand = new AsyncRelayCommand(ConnectWechatAsync, () => CanConnectWechat);
         RefreshAccountsCommand = new AsyncRelayCommand(RefreshAccountsAsync, () => CanConnect);
         DisconnectCommand = new AsyncRelayCommand(DisconnectAsync, () => CanWork);
-        SearchConversationsCommand = new AsyncRelayCommand(SearchConversationsAsync, () => CanWork);
-        ApplyFiltersCommand = new AsyncRelayCommand(() => RunAsync(() => FetchAsync(false), "正在筛选消息…"), () => CanWork && SelectedConversation is not null);
-        ClearFiltersCommand = new AsyncRelayCommand(async () =>
-        {
-            StartDate = null; EndDate = null; SearchQuery = "";
-            await RunAsync(() => FetchAsync(false), "正在加载全部日期…");
-        }, () => CanWork && SelectedConversation is not null);
-        LoadMoreCommand = new AsyncRelayCommand(() => RunAsync(() => FetchAsync(true), "正在加载下一页…"), () => CanLoadMore);
+        SearchConversationsCommand = new AsyncRelayCommand(SearchConversationsAsync, () => CanSelectConversation);
+        ApplyFiltersCommand = new AsyncRelayCommand(ApplyFiltersAsync, () => CanApplyFilters);
+        ClearFiltersCommand = new AsyncRelayCommand(ClearFiltersAsync, () => CanClearFilters);
+        LoadMoreCommand = new AsyncRelayCommand(() => CanLoadMore
+            ? RunAsync(() => FetchAsync(true), "正在加载下一页…") : Task.CompletedTask, () => CanLoadMore);
+        PreviousMessageBatchCommand = new AsyncRelayCommand(() => NavigateMessageBatchAsync(true), () => CanLoadPreviousMessageBatch);
+        NextMessageBatchCommand = new AsyncRelayCommand(() => NavigateMessageBatchAsync(false), () => CanLoadNextMessageBatch);
+        RefreshMessagesCommand = new AsyncRelayCommand(() => CanRefreshMessages
+            ? RunAsync(() => FetchAsync(false), "正在刷新消息首屏…") : Task.CompletedTask, () => CanRefreshMessages);
+        LoadMoreGlobalCommand = new AsyncRelayCommand(LoadMoreGlobalAsync, () => CanLoadMoreGlobal);
+        SwitchToGlobalSearchCommand = new RelayCommand(SwitchToGlobalSearch, () => CanSwitchToGlobalSearch);
+        SwitchToConversationCommand = new AsyncRelayCommand(SwitchToConversationAsync, () => CanSwitchToConversation);
+        ReturnToSearchCommand = new AsyncRelayCommand(ReturnToSearchAsync, () => CanReturnToSearch);
+        BrowseContextConversationCommand = new AsyncRelayCommand(BrowseContextConversationAsync, () => CanBrowseContextConversation);
         ExportJobCommand = new AsyncRelayCommand(ExportJobAsync, () => CanExportJob);
         SaveSceneCommand = new AsyncRelayCommand(SaveSceneAsync, () => CanSaveScene);
         DeleteSceneCommand = new AsyncRelayCommand(DeleteSceneAsync, () => CanDeleteScene);
@@ -147,14 +223,25 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
 
     partial void OnSelectedConversationChanged(Conversation? value)
     {
-        Messages.Clear(); _nextOffset = null;
+        if (!_suppressConversationReset)
+        {
+            ResetMessagePaging();
+            Messages.Clear(); _nextOffset = null; _messageConversationId = null; FiltersDirty = true;
+        }
         ResultPath = ""; ResultSummary = "";
         UpdateFlags();
-        if (value is not null && CanWork) _ = ApplyFiltersCommand.ExecuteAsync(null);
+        if (!_suppressConversationAutoFetch && !IsGlobalSearchMode && !IsContextMode && value is not null && CanWork)
+            _ = ApplyFiltersCommand.ExecuteAsync(null);
     }
     partial void OnStartDateChanged(DateTimeOffset? value) { if (!_suppressSceneDates) MarkDirty(); }
     partial void OnEndDateChanged(DateTimeOffset? value) { if (!_suppressSceneDates) MarkDirty(); }
     partial void OnSearchQueryChanged(string value) => MarkDirty();
+    partial void OnGlobalSearchQueryChanged(string value) => UpdateGlobalCriteriaState();
+    partial void OnGlobalStartDateChanged(DateTimeOffset? value) => UpdateGlobalCriteriaState();
+    partial void OnGlobalEndDateChanged(DateTimeOffset? value) => UpdateGlobalCriteriaState();
+    partial void OnGlobalSearchOrderChanged(string value) => UpdateGlobalCriteriaState();
+    partial void OnIsGlobalSearchModeChanged(bool value) => UpdateFlags();
+    partial void OnIsContextModeChanged(bool value) => UpdateFlags();
     partial void OnUseWechatChanged(bool value)
     {
         _connectedMedia = null;
@@ -230,7 +317,11 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         Status = "开启图片恢复需要重新连接微信后生效。请点击“连接微信”并按提示确认重启微信。";
     }
     partial void OnIsBusyChanged(bool value) => UpdateFlags();
-    partial void OnIsConnectedChanged(bool value) => UpdateFlags();
+    partial void OnIsConnectedChanged(bool value)
+    {
+        if (!value) InvalidateGlobalSource();
+        else UpdateFlags();
+    }
     partial void OnFiltersDirtyChanged(bool value) => UpdateFlags();
     partial void OnErrorChanged(string value) => OnPropertyChanged(nameof(HasError));
     partial void OnResultPathChanged(string value) => OnPropertyChanged(nameof(HasResult));
@@ -247,6 +338,122 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         UpdateFlags();
     }
 
+    private GlobalSearchCriteria CurrentGlobalCriteria() => new(
+        GlobalSearchQuery.Trim(),
+        GlobalStartDate?.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+        GlobalEndDate?.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+        GlobalSearchOrder);
+
+    private void UpdateGlobalCriteriaState()
+    {
+        _globalSearchState.UpdateCriteria(CurrentGlobalCriteria());
+        OnPropertyChanged(nameof(GlobalSearchDirty));
+        UpdateFlags();
+    }
+
+    public bool GlobalSearchDirty => _globalSearchState.IsDirty;
+
+    private void SetGlobalSource(string? sourceSessionId)
+    {
+        ++_sourceEpoch;
+        _globalSearchState.ActivateSource(sourceSessionId);
+        ResetMessagePaging(sourceChanged: true);
+        // No ordinary preview or export scope may survive a different source.
+        _suppressConversationAutoFetch = true;
+        try { SelectedConversation = null; }
+        finally { _suppressConversationAutoFetch = false; }
+        Conversations.Clear();
+        Messages.Clear();
+        _nextOffset = null;
+        _messageConversationId = null;
+        _applied = new DateRange(null, null);
+        MessageSummary = "请选择一个会话。";
+        RangeLabel = "全部日期 · UTC+08:00";
+        FiltersDirty = true;
+        ResultPath = "";
+        ResultSummary = "";
+        GlobalSearchHits.Clear();
+        ContextMessages.Clear();
+        ContextConversation = null;
+        ContextSummary = "";
+        ContextCoverageNotice = "";
+        IsContextMode = false;
+        IsGlobalSearchMode = false;
+        _preContextConversation = null;
+        _globalReturnScrollOffset = 0;
+        OnPropertyChanged(nameof(ContextConversation));
+        OnPropertyChanged(nameof(SourceSessionId));
+        OnPropertyChanged(nameof(GlobalSearchDirty));
+        OnPropertyChanged(nameof(GlobalSearchSummary));
+        OnPropertyChanged(nameof(GlobalCoverageNotice));
+        UpdateFlags();
+    }
+
+    private void InvalidateGlobalSource() => SetGlobalSource(null);
+
+    private void ClearGlobalResults()
+    {
+        _globalSearchState.ClearResults();
+        GlobalSearchHits.Clear();
+        ContextMessages.Clear();
+        ContextConversation = null;
+        ContextSummary = "";
+        ContextCoverageNotice = "";
+        IsContextMode = false;
+        _preContextConversation = null;
+        OnPropertyChanged(nameof(ContextConversation));
+        OnPropertyChanged(nameof(GlobalSearchDirty));
+        OnPropertyChanged(nameof(GlobalSearchSummary));
+        OnPropertyChanged(nameof(GlobalCoverageNotice));
+        UpdateFlags();
+    }
+
+    private void SwitchToGlobalSearch()
+    {
+        if (!CanSwitchToGlobalSearch) return;
+        IsGlobalSearchMode = true;
+        UpdateFlags();
+    }
+
+    private Task SwitchToConversationAsync() => !CanSwitchToConversation ? Task.CompletedTask : RunAsync(async () =>
+    {
+        // Restore an existing ordinary preview without reapplying its edited
+        // filters. In particular, invalid ordinary dates must not trap the user
+        // in global mode with the date controls hidden.
+        IsGlobalSearchMode = false;
+        if (SelectedConversation?.Id != _messageConversationId)
+        {
+            ResetMessagePaging();
+            Messages.Clear(); _nextOffset = null; _messageConversationId = null; FiltersDirty = true;
+            if (SelectedConversation is not null) await FetchAsync(false);
+        }
+        UpdateFlags();
+    }, "正在恢复当前会话浏览…");
+
+    private async Task ApplyFiltersAsync()
+    {
+        if (!CanApplyFilters) return;
+        if (IsGlobalSearchMode) await ExecuteGlobalSearchAsync();
+        else await RunAsync(() => FetchAsync(false), "正在筛选消息…");
+    }
+
+    private async Task ClearFiltersAsync()
+    {
+        if (!CanClearFilters) return;
+        if (IsGlobalSearchMode)
+        {
+            GlobalStartDate = null;
+            GlobalEndDate = null;
+            GlobalSearchQuery = "";
+            GlobalSearchOrder = "desc";
+            ClearGlobalResults();
+            Status = "全局搜索条件已清除。";
+            return;
+        }
+        StartDate = null; EndDate = null; SearchQuery = "";
+        await RunAsync(() => FetchAsync(false), "正在加载全部日期…");
+    }
+
     private void UpdateFlags()
     {
         foreach (var name in new[]
@@ -254,7 +461,17 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
             nameof(CanStartOperation), nameof(CanWork), nameof(CanExport), nameof(CanLoadMore), nameof(IsEmpty), nameof(CanManageJobs),
             nameof(SelectedTitle), nameof(CanConnect), nameof(CanConnectWechat), nameof(CanImportJson),
             nameof(CanTranscribe), nameof(IsWechatMode), nameof(IsOfflineMode), nameof(IsDemoMode),
-            nameof(SourceLabel), nameof(SourceModeLabel),
+            nameof(SourceLabel), nameof(SourceModeLabel), nameof(HasGlobalSearchCapability), nameof(SourceSessionId),
+            nameof(CanUseGlobalSearch), nameof(IsGlobalSearchUnavailable), nameof(CanSwitchToGlobalSearch), nameof(CanSwitchToConversation),
+            nameof(CanEditGlobalFilters), nameof(CanApplyFilters), nameof(CanClearFilters), nameof(CanLoadMoreGlobal),
+            nameof(CanNavigateGlobalHits), nameof(GlobalSearchDirty), nameof(GlobalSearchSummary), nameof(GlobalCoverageNotice), nameof(BrowseModeLabel),
+            nameof(GlobalSearchStatus), nameof(GlobalAppliedFiltersLabel), nameof(CanSelectConversation),
+            nameof(CanReturnToSearch), nameof(CanBrowseContextConversation), nameof(ShowConversationMessages),
+            nameof(ShowGlobalSearchResults), nameof(ShowMessageContext), nameof(EmptyTitle), nameof(EmptyDescription),
+            nameof(ContextFocusIndex), nameof(HasMessageCursorPaginationCapability), nameof(HasMessageKeywordPaginationCapability),
+            nameof(ShowCursorMessageNavigation), nameof(ShowLegacyMessageNavigation), nameof(CanRefreshMessages),
+            nameof(CanLoadPreviousMessageBatch), nameof(CanLoadNextMessageBatch), nameof(MessagePagingStatus),
+            nameof(VisibleMessagePageCount), nameof(VisibleMessageDisplayBytes),
             nameof(CanSaveScene), nameof(CanDeleteScene), nameof(HasJobs), nameof(CanExportJob),
             nameof(SelectedScenePrompt), nameof(HasScenePrompt),
         }) OnPropertyChanged(name);
@@ -262,7 +479,12 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         RefreshAccountsCommand?.NotifyCanExecuteChanged(); DisconnectCommand?.NotifyCanExecuteChanged();
         SearchConversationsCommand?.NotifyCanExecuteChanged();
         ApplyFiltersCommand?.NotifyCanExecuteChanged(); ClearFiltersCommand?.NotifyCanExecuteChanged();
-        LoadMoreCommand?.NotifyCanExecuteChanged(); ExportJobCommand?.NotifyCanExecuteChanged();
+        LoadMoreCommand?.NotifyCanExecuteChanged(); LoadMoreGlobalCommand?.NotifyCanExecuteChanged();
+        PreviousMessageBatchCommand?.NotifyCanExecuteChanged(); NextMessageBatchCommand?.NotifyCanExecuteChanged();
+        RefreshMessagesCommand?.NotifyCanExecuteChanged();
+        SwitchToGlobalSearchCommand?.NotifyCanExecuteChanged(); SwitchToConversationCommand?.NotifyCanExecuteChanged();
+        ReturnToSearchCommand?.NotifyCanExecuteChanged(); BrowseContextConversationCommand?.NotifyCanExecuteChanged();
+        ExportJobCommand?.NotifyCanExecuteChanged();
         SaveSceneCommand?.NotifyCanExecuteChanged(); DeleteSceneCommand?.NotifyCanExecuteChanged();
         RefreshJobsCommand?.NotifyCanExecuteChanged(); TranscribeCommand?.NotifyCanExecuteChanged();
         RefreshVoiceCommand?.NotifyCanExecuteChanged(); PrepareVoiceCommand?.NotifyCanExecuteChanged();
@@ -293,7 +515,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
             IsConnected = true;
             ConnectionLabel = "自动化测试数据 · 本地工作进程";
             Status = "测试数据已连接。";
-            AppLog.Write("demo_connected");
+            Log("demo_connected");
             await LoadConversationsAsync();
             await RefreshAuxiliaryAsync(current);
             OnPropertyChanged(nameof(ConnectionLabel));
@@ -311,20 +533,25 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
 
     private async Task<WorkerClient> StartWorkerAsync()
     {
+        SetGlobalSource(null);
+        _workerCapabilities.Clear();
+        _messageCursorSources = null;
+        _messageKeywordSources = null;
         if (_worker is not null) await _worker.DisposeAsync();
-        _worker = WorkerClient.Start(WorkerLocator.Locate());
+        _worker = _startWorker();
         var current = _worker;
-        current.DiagnosticReceived += () => AppLog.Write("worker_diagnostic_received");
-        current.ProgressReceived += progress => _dispatcher.TryEnqueue(() =>
+        current.DiagnosticReceived += () => Log("worker_diagnostic_received");
+        current.ProgressReceived += progress => _enqueue(() =>
         {
             if (!ReferenceEquals(_worker, current)) return;
             ProgressLabel = progress.Total > 0 ? $"{progress.Label}（{progress.Current}/{progress.Total}）" : progress.Label;
             if (!string.IsNullOrWhiteSpace(progress.Label)) Status = progress.Label;
         });
-        current.Disconnected += failure => _dispatcher.TryEnqueue(() =>
+        current.Disconnected += failure => _enqueue(() =>
         {
             if (_closing || !ReferenceEquals(_worker, current)) return;
             _connectedMedia = null;
+            InvalidateGlobalSource();
             IsConnected = false; ConnectionLabel = "连接已断开";
             // A late disconnect notification must not erase the conservative
             // PRUNE_RESULT_UNKNOWN warning for this worker instance.
@@ -333,11 +560,21 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
                 Error = failure.Message;
                 Status = "任务未完成，可重新检测。";
             }
-            AppLog.Write("worker_disconnected", failure.Code);
+            Log("worker_disconnected", failure.Code);
         });
         var hello = await current.RequestAsync("hello", new { });
         if (hello.GetProperty("protocolVersion").GetInt32() != Protocol.Version || hello.GetProperty("timezone").GetString() != "UTC+08:00")
             throw new WorkerException("PROTOCOL_ERROR", "工作进程的协议或时区不兼容。");
+        _workerCapabilities.Clear();
+        if (hello.TryGetProperty("capabilities", out var capabilityElement) && capabilityElement.ValueKind == JsonValueKind.Array)
+            foreach (var capability in capabilityElement.EnumerateArray())
+                if (capability.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(capability.GetString()))
+                    _workerCapabilities.Add(capability.GetString()!);
+        ReadMessagePagingCapabilities(hello);
+        if (hello.TryGetProperty("sourceSessionId", out var sessionElement) && sessionElement.ValueKind == JsonValueKind.String)
+            SetGlobalSource(sessionElement.GetString());
+        else
+            UpdateFlags();
         return current;
     }
 
@@ -356,13 +593,16 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
             enableImages = EnableImages, enableVoice = EnableVoice
         }, TimeSpan.FromMinutes(6))).Deserialize<ConnectResult>(Protocol.Json)
             ?? throw new WorkerException("PROTOCOL_ERROR", "微信连接结果格式不正确。");
+        if (!connected.Connected || connected.Source != "wechat4" || connected.ConversationCount < 0 || connected.MessageTableCount < 0)
+            throw new WorkerException("PROTOCOL_ERROR", "微信连接结果未确认有效的数据源。");
         _connectedMedia = new ConnectionMedia(EnableImages, connected.ImageKeyAvailable,
             EnableVoice, connected.VoiceAvailable);
+        SetGlobalSource(connected.SourceSessionId);
         IsConnected = true;
         RememberAccountName(connected.AccountLabel);
         ConnectionLabel = $"{connected.AccountLabel ?? SelectedAccount.Label} · 只读";
         Status = $"微信已连接：{connected.ConversationCount} 个会话，{connected.MessageTableCount} 张消息表。";
-        AppLog.Write("wechat_connected");
+        Log("wechat_connected");
         await LoadConversationsAsync();
         await RefreshAuxiliaryAsync(current);
         if (EnableImages && !connected.ImageKeyAvailable)
@@ -411,7 +651,8 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         var current = imported.Worker;
         var result = imported.Response.Deserialize<OfflineImportResult>(Protocol.Json)
             ?? throw new WorkerException("PROTOCOL_ERROR", "离线导入结果格式不正确。");
-        if (!string.Equals(result.Source, "offline", StringComparison.Ordinal) ||
+        if (result.ConversationCount < 0 || result.MessageCount < 0 ||
+            !string.Equals(result.Source, "offline", StringComparison.Ordinal) ||
             !string.Equals(result.Schema, "wechat-memory-json-v1", StringComparison.Ordinal) &&
             !string.Equals(result.Schema, "demo-json-v1", StringComparison.Ordinal))
             throw new WorkerException("PROTOCOL_ERROR", "工作进程返回了不兼容的离线数据源结果。");
@@ -421,6 +662,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         _offlineMode = true;
         _offlinePath = path;
         _connectedMedia = null;
+        SetGlobalSource(result.SourceSessionId);
         IsConnected = true;
         Accounts.Clear();
         SelectedAccount = null;
@@ -433,7 +675,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         await LoadConversationsAsync();
         await RefreshAuxiliaryAsync(current);
         Status = $"离线 JSON 已加载：{result.ConversationCount} 个会话，{result.MessageCount} 条消息。";
-        AppLog.Write("offline_json_imported");
+        Log("offline_json_imported");
     }, "正在验证并导入离线 JSON…");
 
     private void RememberAccountName(string? name)
@@ -462,26 +704,55 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         Status = "已断开微信。工作进程仍在运行。";
     }, "正在断开…");
 
-    private async Task LoadConversationsAsync(string? query = null)
+    private async Task LoadConversationsAsync(string? query = null, bool loadMessages = true,
+        bool preserveMessageState = false, string? preferredConversationId = null)
     {
         var current = _worker ?? throw new WorkerException("WORKER_EXITED", "工作进程不可用。");
-        var previousId = SelectedConversation?.Id;
-        var list = (await current.RequestAsync("list_conversations", new { source = CurrentSource, query }))
-            .Deserialize<ConversationResult>(Protocol.Json)
-            ?? throw new WorkerException("PROTOCOL_ERROR", "会话列表格式不正确。");
-        Conversations.Clear(); Messages.Clear(); ResultPath = ""; ResultSummary = "";
-        foreach (var item in list.Items) Conversations.Add(item);
-        OnPropertyChanged(nameof(SelectedConversation));
-        SelectedConversation = Conversations.FirstOrDefault(item => item.Id == previousId) ?? Conversations.FirstOrDefault();
+        var previousId = preferredConversationId ?? SelectedConversation?.Id;
+        var list = await RequestConversationsAsync(current, query);
+        if (!ReferenceEquals(_worker, current) || !current.IsAvailable || !IsConnected || _closing)
+            throw new WorkerException("SOURCE_CHANGED", "数据源已变化，未应用过期的会话列表。");
+        if (!string.IsNullOrWhiteSpace(list.SourceSessionId) &&
+            !string.Equals(list.SourceSessionId, _globalSearchState.SourceSessionId, StringComparison.Ordinal))
+            SetGlobalSource(list.SourceSessionId);
+        _suppressConversationReset = preserveMessageState;
+        _suppressConversationAutoFetch = true;
+        try
+        {
+            // ListView can synchronously clear its TwoWay SelectedItem when the
+            // collection is reset; suppression must include the collection edit.
+            Conversations.Clear();
+            if (!preserveMessageState) Messages.Clear();
+            ResultPath = ""; ResultSummary = "";
+            foreach (var item in list.Items) Conversations.Add(item);
+            SelectedConversation = Conversations.FirstOrDefault(item => item.Id == previousId) ?? Conversations.FirstOrDefault();
+        }
+        finally
+        {
+            _suppressConversationReset = false;
+            _suppressConversationAutoFetch = false;
+        }
         OnPropertyChanged(nameof(SelectedTitle));
         if (SelectedConversation is null) { MessageSummary = "没有可用会话。"; Status = "没有会话可显示。"; return; }
-        await FetchAsync(false);
+        if (loadMessages && !IsGlobalSearchMode && !IsContextMode) await FetchAsync(false);
     }
 
-    private Task SearchConversationsAsync() => RunAsync(async () =>
+    private async Task<ConversationResult> RequestConversationsAsync(WorkerClient worker, string? query)
+    {
+        var list = (await worker.RequestAsync("list_conversations", new { source = CurrentSource, query }))
+            .Deserialize<ConversationResult>(Protocol.Json)
+            ?? throw new WorkerException("PROTOCOL_ERROR", "会话列表格式不正确。");
+        if (list.Items is null || list.Items.Any(item => item is null || string.IsNullOrWhiteSpace(item.Id) ||
+            item.Title is null || item.Kind is null || item.MessageCount < 0) ||
+            list.Items.Select(item => item.Id).Distinct(StringComparer.Ordinal).Count() != list.Items.Count)
+            throw new WorkerException("PROTOCOL_ERROR", "会话列表包含无效或重复的会话身份。");
+        return list;
+    }
+
+    private Task SearchConversationsAsync() => !CanSelectConversation ? Task.CompletedTask : RunAsync(async () =>
     {
         var query = string.IsNullOrWhiteSpace(ConversationQuery) ? null : ConversationQuery.Trim();
-        await LoadConversationsAsync(query);
+        await LoadConversationsAsync(query, preserveMessageState: IsGlobalSearchMode);
         Status = query is null ? "已显示全部会话。" : $"已按会话名称筛选：{query}";
     }, "正在筛选会话…");
 
@@ -502,31 +773,240 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
     // Messages and export
     // ------------------------------------------------------------------ //
 
-    private async Task FetchAsync(bool more)
+    private async Task FetchAsync(bool more, Conversation? targetConversation = null)
     {
-        if (SelectedConversation is null) { MessageSummary = "没有可用会话。"; Status = "没有会话。"; return; }
+        var conversation = targetConversation ?? SelectedConversation;
+        if (conversation is null) { MessageSummary = "没有可用会话。"; Status = "没有会话。"; return; }
+        var worker = _worker is { IsAvailable: true } current ? current
+            : throw new WorkerException("WORKER_EXITED", "工作进程不可用，请重新检测。");
+        long epoch = _sourceEpoch;
         var range = more ? _applied : DateRange.Create(StartDate, EndDate);
         var query = string.IsNullOrWhiteSpace(SearchQuery) ? null : SearchQuery.Trim();
-        var result = (await _worker!.RequestAsync("get_messages", new
+        if (!more && query is not null && await TryFetchKeywordFirstAsync(
+                worker, conversation, range, query, epoch, targetConversation is not null)) return;
+        if (!more && await TryFetchCursorFirstAsync(worker, conversation, range, query, epoch, targetConversation is not null)) return;
+        int offset = more ? _nextOffset ?? 0 : 0;
+        var result = (await worker.RequestAsync("get_messages", new
         {
-            source = CurrentSource, conversationId = SelectedConversation.Id,
+            source = CurrentSource, conversationId = conversation.Id,
             startDate = range.StartDate, endDate = range.EndDate,
-            query, order = "desc", offset = more ? _nextOffset ?? 0 : 0, limit = 50
+            query, order = "desc", offset, limit = 50
         })).Deserialize<MessageResult>(Protocol.Json) ?? throw new WorkerException("PROTOCOL_ERROR", "消息列表格式不正确。");
+        EnsureMessageRequestCurrent(worker, conversation, range, query, epoch, targetConversation is not null);
+        if (result.Items is null || result.Total < offset || result.Items.Count > 50 ||
+            result.Items.Count > result.Total - offset ||
+            result.NextOffset != (offset + result.Items.Count < result.Total ? offset + result.Items.Count : (int?)null) ||
+            result.Items.Count == 0 && offset < result.Total ||
+            result.Items.Any(item => item is null || string.IsNullOrWhiteSpace(item.Id) || item.Sender is null ||
+                item.Content is null || item.Kind is null || !DateTimeOffset.TryParse(item.Timestamp,
+                    System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out _)))
+            throw new WorkerException("PROTOCOL_ERROR", "消息页内容、总数或分页位置不一致。");
+        foreach (var item in result.Items) MessageProjectionReader.Validate(item);
+
+        // A context -> ordinary transition does not change selection until its
+        // first page has succeeded and passed all validation above.
+        CommitMessageSelection(conversation, targetConversation is not null);
+        ResetMessagePaging();
+        _messagePagingNotice = LegacyPagingNotice(query, conversation.Id);
         if (!more) Messages.Clear();
         foreach (var item in result.Items) Messages.Add(item);
-        _nextOffset = result.NextOffset; _applied = range;
+        _nextOffset = result.NextOffset; _applied = range; _messageConversationId = conversation.Id;
         FiltersDirty = false;
         RangeLabel = query is null ? range.Label : $"{range.Label} · 搜索“{query}”";
-        MessageSummary = result.Total == 0 ? "此会话题在所选条件下没有消息。" : $"已显示 {Messages.Count} / {result.Total} 条消息";
+        MessageSummary = result.Total == 0 ? "此会话在所选条件下没有消息。" : $"已显示 {Messages.Count} / {result.Total} 条消息";
         Status = result.Total == 0 ? "筛选完成，没有符合条件的消息。" : "消息已加载，可按当前范围导出。";
         UpdateFlags();
     }
+
+    private Task ExecuteGlobalSearchAsync() => RunAsync(async () =>
+    {
+        var worker = _worker is { IsAvailable: true } current
+            ? current : throw new WorkerException("WORKER_EXITED", "工作进程不可用，请重新检测。");
+        string sourceSessionId = _globalSearchState.SourceSessionId
+            ?? throw new WorkerException("CAPABILITY_UNAVAILABLE", "当前数据源未提供全局搜索能力。");
+        if (!HasGlobalSearchCapability)
+            throw new WorkerException("CAPABILITY_UNAVAILABLE", "当前工作进程不支持全局搜索。");
+        var criteria = CurrentGlobalCriteria();
+        _ = DateRange.Create(GlobalStartDate, GlobalEndDate);
+        long epoch = _sourceEpoch;
+        var candidate = await _globalSearchWorkflow.SearchFirstPageAsync(worker, CurrentSource, sourceSessionId, criteria);
+        EnsureGlobalSourceCurrent(worker, sourceSessionId, epoch);
+        if (CurrentGlobalCriteria() != criteria)
+        {
+            _globalSearchState.UpdateCriteria(CurrentGlobalCriteria());
+            OnPropertyChanged(nameof(GlobalSearchDirty));
+            UpdateFlags();
+            throw new WorkerException("SEARCH_STALE", "搜索条件已变化，未应用迟到的结果。请重新执行搜索。");
+        }
+        _globalSearchState.CommitSearch(criteria, candidate);
+        GlobalSearchHits.Clear();
+        foreach (var hit in candidate.Items) GlobalSearchHits.Add(hit);
+        ContextMessages.Clear();
+        ContextConversation = null;
+        IsContextMode = false;
+        OnPropertyChanged(nameof(ContextConversation));
+        OnPropertyChanged(nameof(GlobalSearchDirty));
+        OnPropertyChanged(nameof(GlobalSearchSummary));
+        OnPropertyChanged(nameof(GlobalCoverageNotice));
+        Status = candidate.Total == 0
+            ? "全局搜索完成，没有符合条件的消息。"
+            : $"全局搜索完成：{candidate.Items.Count:N0} / {candidate.Total:N0} 条命中已载入。";
+        UpdateFlags();
+    }, "正在搜索当前数据源中的全部会话…");
+
+    private Task LoadMoreGlobalAsync() => !CanLoadMoreGlobal ? Task.CompletedTask : RunAsync(async () =>
+    {
+        var worker = _worker is { IsAvailable: true } current
+            ? current : throw new WorkerException("WORKER_EXITED", "工作进程不可用，请重新检测。");
+        var sourceSessionId = _globalSearchState.SourceSessionId
+            ?? throw new WorkerException("SOURCE_CHANGED", "数据源已变化，请重新搜索。");
+        var snapshot = _globalSearchState.Snapshot
+            ?? throw new WorkerException("PAGE_EXPIRED", "全局搜索结果已过期，请重新搜索。");
+        int previousCount = snapshot.Items.Count;
+        long epoch = _sourceEpoch;
+        var candidate = await _globalSearchWorkflow.SearchNextPageAsync(worker, CurrentSource, snapshot);
+        EnsureGlobalSourceCurrent(worker, sourceSessionId, epoch);
+        _globalSearchState.CommitNextPage(candidate);
+        foreach (var hit in candidate.Items.Skip(previousCount)) GlobalSearchHits.Add(hit);
+        OnPropertyChanged(nameof(GlobalSearchSummary));
+        OnPropertyChanged(nameof(GlobalCoverageNotice));
+        Status = $"已载入 {GlobalSearchHits.Count:N0} / {candidate.Total:N0} 条全局搜索命中。";
+        UpdateFlags();
+    }, "正在加载下一页全局搜索结果…");
+
+    private void EnsureGlobalSourceCurrent(WorkerClient worker, string sourceSessionId, long epoch)
+    {
+        if (epoch != _sourceEpoch || !ReferenceEquals(_worker, worker) || !worker.IsAvailable || !IsConnected || _closing ||
+            !string.Equals(_globalSearchState.SourceSessionId, sourceSessionId, StringComparison.Ordinal))
+            throw new WorkerException("SOURCE_CHANGED", "数据源已变化，未应用过期的搜索结果。");
+    }
+
+    private void EnsureGlobalSnapshotCurrent(GlobalSearchSnapshot snapshot)
+    {
+        if (!_globalSearchState.CanNavigate ||
+            !string.Equals(_globalSearchState.Snapshot?.SearchId, snapshot.SearchId, StringComparison.Ordinal))
+            throw new WorkerException("SEARCH_STALE", "搜索条件或结果集已变化，请重新执行搜索。");
+    }
+
+    public async Task<bool> OpenGlobalHitAsync(GlobalSearchHit hit, double returnScrollOffset = 0)
+    {
+        if (!CanNavigateGlobalHits || _globalSearchState.Snapshot is not { } snapshot ||
+            !GlobalSearchHits.Any(item => item.HitId == hit.HitId)) return false;
+        bool opened = false;
+        await RunAsync(async () =>
+        {
+            var worker = _worker is { IsAvailable: true } current
+                ? current : throw new WorkerException("WORKER_EXITED", "工作进程不可用，请重新检测。");
+            string sourceSessionId = _globalSearchState.SourceSessionId
+                ?? throw new WorkerException("SOURCE_CHANGED", "数据源已变化，请重新搜索。");
+            long epoch = _sourceEpoch;
+            var context = await _globalSearchWorkflow.GetContextAsync(worker, CurrentSource, snapshot, hit);
+            EnsureGlobalSourceCurrent(worker, sourceSessionId, epoch);
+            EnsureGlobalSnapshotCurrent(snapshot);
+
+            Conversation? previousConversation = SelectedConversation;
+            bool conversationVisible = Conversations.Any(item => item.Id == context.Conversation.Id);
+            bool conversationFilterHidTarget = !conversationVisible && !string.IsNullOrWhiteSpace(ConversationQuery);
+            ConversationResult? expandedList = null;
+            if (!conversationVisible)
+            {
+                // Stage the unfiltered list too. A failed list request or a changed
+                // source must not partially clear the filter/selection behind the results.
+                var list = await RequestConversationsAsync(worker, query: null);
+                EnsureGlobalSourceCurrent(worker, sourceSessionId, epoch);
+                EnsureGlobalSnapshotCurrent(snapshot);
+                if (!string.Equals(list.SourceSessionId, sourceSessionId, StringComparison.Ordinal) ||
+                    !list.Items.Any(item => item.Id == context.Conversation.Id && item.Kind == context.Conversation.Kind))
+                    throw new WorkerException("SEARCH_SOURCE_CHANGED", "目标会话或数据源已变化，请重新搜索。");
+                expandedList = list;
+            }
+
+            _preContextConversation = previousConversation;
+            _globalReturnScrollOffset = double.IsFinite(returnScrollOffset) ? Math.Max(0, returnScrollOffset) : 0;
+            _suppressConversationReset = true;
+            _suppressConversationAutoFetch = true;
+            try
+            {
+                if (expandedList is not null)
+                {
+                    Conversations.Clear();
+                    foreach (var item in expandedList.Items) Conversations.Add(item);
+                    ConversationQuery = "";
+                }
+                SelectedConversation = Conversations.FirstOrDefault(item => item.Id == context.Conversation.Id)
+                    ?? context.Conversation;
+            }
+            finally { _suppressConversationReset = false; _suppressConversationAutoFetch = false; }
+
+            ContextMessages.Clear();
+            foreach (var item in context.Items) ContextMessages.Add(item);
+            ContextConversation = context.Conversation;
+            ContextSummary = $"上下文 {context.FocusIndex + 1} / {context.Items.Count}" +
+                (context.HasEarlier ? " · 前面还有消息" : "") + (context.HasLater ? " · 后面还有消息" : "");
+            ContextCoverageNotice = snapshot.CoverageNotice;
+            IsGlobalSearchMode = true;
+            IsContextMode = true;
+            OnPropertyChanged(nameof(ContextConversation));
+            OnPropertyChanged(nameof(SelectedTitle));
+            Status = conversationFilterHidTarget
+                ? "已清除会话名称筛选，并打开经过验证的消息上下文。"
+                : "已打开经过验证的消息上下文；此范围不包含完整会话。";
+            UpdateFlags();
+            opened = true;
+        }, "正在验证原消息并读取邻近上下文…");
+        return opened;
+    }
+
+    private Task ReturnToSearchAsync()
+    {
+        if (!CanReturnToSearch) return Task.CompletedTask;
+        var restore = _preContextConversation;
+        _suppressConversationReset = true;
+        _suppressConversationAutoFetch = true;
+        try
+        {
+            SelectedConversation = restore is null ? null :
+                Conversations.FirstOrDefault(item => item.Id == restore.Id) ?? restore;
+        }
+        finally { _suppressConversationReset = false; _suppressConversationAutoFetch = false; }
+        ContextMessages.Clear();
+        ContextConversation = null;
+        ContextSummary = "";
+        ContextCoverageNotice = "";
+        IsContextMode = false;
+        IsGlobalSearchMode = true;
+        _preContextConversation = null;
+        OnPropertyChanged(nameof(ContextConversation));
+        OnPropertyChanged(nameof(SelectedTitle));
+        Status = "已返回原全局搜索结果。";
+        UpdateFlags();
+        return Task.CompletedTask;
+    }
+
+    private Task BrowseContextConversationAsync() => !CanBrowseContextConversation ? Task.CompletedTask : RunAsync(async () =>
+    {
+        if (ContextConversation is null) throw new WorkerException("INVALID_ARGUMENT", "没有可浏览的目标会话。");
+        var target = Conversations.FirstOrDefault(item => item.Id == ContextConversation.Id) ?? ContextConversation;
+        await FetchAsync(false, target);
+        ContextMessages.Clear();
+        ContextConversation = null;
+        ContextSummary = "";
+        ContextCoverageNotice = "";
+        IsContextMode = false;
+        IsGlobalSearchMode = false;
+        _preContextConversation = null;
+        OnPropertyChanged(nameof(ContextConversation));
+        OnPropertyChanged(nameof(SelectedTitle));
+        Status = "已恢复为单会话浏览。";
+        UpdateFlags();
+    }, "正在恢复目标会话浏览…");
 
     public Task ExportAsync(string path) => ExportAsync(path, "markdown", false);
 
     public Task ExportAsync(string path, string format, bool includePages) => RunAsync(async () =>
     {
+        if (IsGlobalSearchMode || IsContextMode)
+            throw new WorkerException("INVALID_ARGUMENT", "全局搜索结果和有限上下文不能直接导出；请返回单会话浏览后再导出。");
         if (SelectedConversation is null || FiltersDirty) throw new WorkerException("INVALID_ARGUMENT", "请先选择会话并应用筛选。");
         var range = _applied;
         var query = string.IsNullOrWhiteSpace(SearchQuery) ? null : SearchQuery.Trim();
@@ -555,7 +1035,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
             _ => $"{result.MessageCount} 条消息 · {result.Bytes:N0} 字节",
         };
         Status = $"导出完成：{ResultSummary}";
-        AppLog.Write("export_completed", format.ToUpperInvariant());
+        Log("export_completed", format.ToUpperInvariant());
     }, format == "pdf" ? "正在生成 PDF…" : "正在导出…");
 
     // ------------------------------------------------------------------ //
@@ -611,6 +1091,8 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
 
     private async Task ExportJobAsync() => await RunAsync(async () =>
     {
+        if (IsGlobalSearchMode || IsContextMode)
+            throw new WorkerException("INVALID_ARGUMENT", "全局搜索结果和有限上下文不能生成普通会话任务。");
         if (SelectedConversation is null || FiltersDirty) throw new WorkerException("INVALID_ARGUMENT", "请先选择会话并应用筛选。");
         var formats = new List<string>();
         if (ExportMarkdown) formats.Add("markdown");
@@ -636,7 +1118,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         ResultSummary = job.Summary;
         Status = $"任务 {job.JobId} 已创建：{job.StatusLabel}。";
         await LoadJobsCoreAsync(_worker);
-        AppLog.Write("job_created");
+        Log("job_created");
     }, "正在生成任务与导出文件…");
 
     private Task LoadJobsAsync() => RunAsync(async () =>
@@ -822,7 +1304,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
                 if (cleanupWorker is not null) _disconnectStatusGuard.Preserve(cleanupWorker);
                 Error = error.Message;
                 Status = "清理结果未知，请刷新任务历史核实。";
-                AppLog.Write("request_failed", error.Code);
+                Log("request_failed", error.Code);
             }
             else
             {
@@ -899,12 +1381,14 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
             await _worker.RequestAsync("prepare_voice_model", new { consent = true }, TimeSpan.FromMinutes(30));
             await RefreshVoiceStatusCoreAsync(_worker);
             Status = "语音模型已准备好，可以转写当前会话的语音。";
-            AppLog.Write("voice_model_ready");
+            Log("voice_model_ready");
         }, "正在下载或加载语音模型（首次可能需要较长时间）…");
     }
 
     private Task TranscribeAsync() => RunAsync(async () =>
     {
+        if (IsGlobalSearchMode || IsContextMode)
+            throw new WorkerException("INVALID_ARGUMENT", "全局搜索和上下文模式不能执行单会话语音转写。");
         if (SelectedConversation is null) throw new WorkerException("INVALID_ARGUMENT", "请先选择会话。");
         var query = string.IsNullOrWhiteSpace(SearchQuery) ? null : SearchQuery.Trim();
         var result = (await _worker!.RequestAsync("transcribe_messages", new
@@ -914,7 +1398,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         }, TimeSpan.FromMinutes(30))).Deserialize<TranscribeResult>(Protocol.Json);
         await FetchAsync(false);
         Status = result is null ? "语音转写完成。" : $"语音转写完成：{result.Transcribed} / {result.Total} 条消息有转写。";
-        AppLog.Write("voice_transcribed");
+        Log("voice_transcribed");
     }, "正在本地转写语音…");
 
     // ------------------------------------------------------------------ //
@@ -923,7 +1407,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
 
     public void ShowError(string message, string code)
     {
-        Error = message; Status = "操作未完成。"; AppLog.Write("ui_operation_failed", code);
+        Error = message; Status = "操作未完成。"; Log("ui_operation_failed", code);
     }
 
     private async Task RunAsync(Func<Task> operation, string status)
@@ -947,9 +1431,45 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
+    private void Log(string name, string code = "OK") => _log(name, code);
+
     private void HandleWorkerFailure(WorkerException error)
     {
-        Error = error.Message; Status = "任务未完成。"; AppLog.Write("request_failed", error.Code);
+        Error = error.Message; Status = "任务未完成。"; Log("request_failed", error.Code);
+        if (error.Code == "SOURCE_SESSION_CHANGED")
+        {
+            // The worker no longer owns this source instance. Do not leave an
+            // ordinary export scope enabled behind a disconnected search screen.
+            IsConnected = false;
+            InvalidateGlobalSource();
+            ConnectionLabel = "数据源已失效 · 请重新连接或导入";
+        }
+        else if (IsGlobalSearchMode && error.Code is "SEARCH_EXPIRED" or "SEARCH_SOURCE_CHANGED" or
+            "CONTEXT_TARGET_CHANGED" or "CONTEXT_TARGET_UNKNOWN" or "PAGE_EXPIRED" or "PAGE_SOURCE_CHANGED")
+        {
+            _globalSearchState.InvalidateResults(error.Message);
+            UpdateFlags();
+        }
+        else if (!IsGlobalSearchMode && _messagePageWindow is not null && IsMessagePagingFailure(error))
+        {
+            // Keep the last successfully committed window visible. A failed
+            // keyword scan, expired snapshot, changed source, budget rejection,
+            // or malformed response must never turn a partial response into a
+            // replacement page or silently fall back during navigation.
+            _messagePagingInvalidation = error.Code is "PAGE_EXPIRED" or "PAGE_SOURCE_CHANGED" or "PAGE_CRITERIA_CHANGED"
+                ? _messagePageWindow.First.IsKeyword
+                    ? "消息关键词快照已失效，请点击“刷新首屏”；不会把新数据接到旧游标后。"
+                    : "消息预览已失效，请点击“刷新首屏”；不会把新数据接到旧游标后。"
+                : "消息页未能完成读取；最后一页仍保留，请点击“刷新首屏”重试。";
+            if (IsCursorCompatibilityFailure(error) && _messageConversationId is not null)
+            {
+                if (_messagePageWindow.First.IsKeyword)
+                    _legacyKeywordPagingConversations[_messageConversationId] = "此会话结构不再支持关键词快照分页，已降级";
+                else
+                    _legacyPagingConversations[_messageConversationId] = "此会话结构不再支持稳定游标分页，已降级";
+            }
+            UpdateFlags();
+        }
         if (error.Code == "WECHAT_LOGIN_TIMEOUT")
             AccountHint = "微信登录超时。请手动打开并登录微信，然后点击“刷新”再试。";
         else if (error.Code == "WECHAT_KEY_UNAVAILABLE")
@@ -962,7 +1482,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
     private void HandleResultFailure(Exception error)
     {
         Error = "处理结果失败。请重新连接或检查输出文件夹权限。"; Status = "任务未完成。";
-        AppLog.Write("result_failed", error.GetType().Name);
+        Log("result_failed", error.GetType().Name);
     }
 
     private static bool IsHandledResultFailure(Exception error) =>
@@ -977,6 +1497,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _closing = true; IsConnected = false;
+        InvalidateGlobalSource();
         if (_worker is not null) await _worker.DisposeAsync();
     }
 }

@@ -25,25 +25,100 @@ public sealed record ChatMessage(
     bool IsOutgoing = false,
     string? AttachmentPath = null,
     int? DurationMs = null,
-    string? Transcript = null)
+    string? Transcript = null,
+    bool IsContextFocus = false) : MessageProjection
 {
     public string TimeLabel => DateTimeOffset.Parse(Timestamp, CultureInfo.InvariantCulture)
         .ToOffset(TimeSpan.FromHours(8)).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
-    public string KindLabel => Kind switch
-    {
-        "image" => "图片",
-        "file" => "文件",
-        "voice" => "语音",
-        "system" => "系统",
-        _ => "文本",
-    };
+    public string KindLabel => KindLabelFor(DisplayKind, Kind);
     public bool HasAttachment => !string.IsNullOrWhiteSpace(AttachmentPath) && File.Exists(AttachmentPath);
     public bool HasTranscript => !string.IsNullOrWhiteSpace(Transcript);
     public string AttachmentLabel => HasAttachment ? "打开已恢复图片" : "";
+    public string FocusLabel => IsContextFocus ? "搜索命中" : "";
 }
 
-public sealed record ConversationResult(List<Conversation> Items);
+public sealed record ConversationResult(List<Conversation> Items, string? SourceSessionId = null);
 public sealed record MessageResult(List<ChatMessage> Items, int Total, int? NextOffset);
+
+public sealed record GlobalSearchCriteria(string Query, string? StartDate, string? EndDate, string Order)
+{
+    public bool IsExecutable => !string.IsNullOrWhiteSpace(Query);
+}
+
+public sealed record GlobalSearchHit(
+    string HitId,
+    string ConversationId,
+    string ConversationTitle,
+    string ConversationKind,
+    string MessageId,
+    string Sender,
+    string Timestamp,
+    string Kind,
+    string Snippet,
+    IReadOnlyList<string> MatchedFields) : MessageProjection
+{
+    public string TimeLabel => DateTimeOffset.Parse(Timestamp, CultureInfo.InvariantCulture)
+        .ToOffset(TimeSpan.FromHours(8)).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+    public string KindLabel => KindLabelFor(DisplayKind, Kind);
+    public string MatchedFieldsLabel => string.Join("、", MatchedFields.Select(fieldName => fieldName switch
+    {
+        "sender" => "发送者", "content" => "正文", "kind" => "类型", "transcript" => "转写", _ => fieldName,
+    }));
+    public Conversation Conversation => new(ConversationId, ConversationTitle, 0, ConversationKind, CountKnown: false);
+}
+
+public sealed record GlobalSearchSnapshot(
+    string SearchId,
+    string SourceSessionId,
+    IReadOnlyList<GlobalSearchHit> Items,
+    int Total,
+    int ResultLimit,
+    bool Truncated,
+    int? NextOffset,
+    JsonElement Coverage)
+{
+    public string CoverageNotice => GlobalSearchCoverage.Format(Coverage);
+    public string Summary => Truncated
+        ? $"共 {Total:N0} 条命中；仅开放排序前 {ResultLimit:N0} 条。"
+        : $"共 {Total:N0} 条命中。";
+}
+
+public sealed record MessageContextResult(
+    Conversation Conversation,
+    IReadOnlyList<ChatMessage> Items,
+    int FocusIndex,
+    bool HasEarlier,
+    bool HasLater);
+
+public static class GlobalSearchCoverage
+{
+    public static string Format(JsonElement coverage)
+    {
+        if (coverage.ValueKind != JsonValueKind.Object) return "";
+        int partial = ReadCount(coverage, "partialMessages") ?? ReadCount(coverage, "partialCount") ?? 0;
+        bool incomplete = coverage.TryGetProperty("complete", out var complete) && complete.ValueKind == JsonValueKind.False;
+        string? note = ReadText(coverage, "warning") ?? ReadText(coverage, "message");
+        if (coverage.TryGetProperty("warnings", out var warnings) && warnings.ValueKind == JsonValueKind.Array)
+        {
+            var first = warnings.EnumerateArray().FirstOrDefault(item => item.ValueKind == JsonValueKind.String);
+            if (first.ValueKind == JsonValueKind.String) note ??= first.GetString();
+        }
+        if (partial > 0 || incomplete)
+            return string.IsNullOrWhiteSpace(note)
+                ? $"部分复杂消息未完整展开{(partial > 0 ? $"（{partial:N0} 条）" : "")}，搜索覆盖可能不完整。"
+                : $"搜索覆盖可能不完整{(partial > 0 ? $"（{partial:N0} 条）" : "")}：{note}";
+        return note ?? "";
+    }
+
+    private static int? ReadCount(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number &&
+        value.TryGetInt32(out int count) && count >= 0 ? count : null;
+
+    private static string? ReadText(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() : null;
+}
+
 public sealed record ExportResult(string Path, int MessageCount, long Bytes);
 public sealed record ExportDetail(
     string Path,
@@ -71,13 +146,15 @@ public sealed record ConnectResult(
     int ConversationCount,
     int MessageTableCount,
     bool ImageKeyAvailable,
-    bool VoiceAvailable);
+    bool VoiceAvailable,
+    string? SourceSessionId = null);
 
 public sealed record OfflineImportResult(
     string Source,
     string Schema,
     int ConversationCount,
-    int MessageCount);
+    int MessageCount,
+    string? SourceSessionId = null);
 
 public sealed record SceneItem(
     string Id,

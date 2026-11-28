@@ -129,7 +129,9 @@ def export_conversation(
     copied into ``<stem>_assets/`` for Markdown/JSON. Images that are missing,
     unreadable, or disabled become explicit placeholders. File and voice
     messages never become links; a voice transcript is used as text when it
-    exists (unless media materialisation is disabled).
+    exists (unless media materialisation is disabled). Canonical card/forward
+    content is already plain text: it is not parsed again or opened as a path.
+    JSON v1 retains its content/reply_to, not a structured card or forward tree.
     """
     try:
         return _export(
@@ -528,8 +530,45 @@ def _voice_or_placeholder(
 
 
 # --------------------------------------------------------------------------- #
+# Shared FILE text convention
+# --------------------------------------------------------------------------- #
+
+# FILE also carries appmsg_parser's canonical text, without a new vendor model
+# or a card tree. Multiline bodies and the parser's single-line labels are text,
+# not attachment paths. This is only an output convention: never reparse XML or
+# probe a purported filename to decide how to display it.
+_APPMSG_TEXT_PREFIXES = ("[链接] ", "[文件] ", "[聊天记录] ", "[不支持的卡片类型: ")
+_APPMSG_TEXT_NOTICES = frozenset({
+    "[卡片类型冲突，未展开]",
+    "[消息XML包含禁止的DTD/实体声明，未展开]",
+    "[消息XML超过安全预算，未展开]",
+    "[消息XML格式无效，未展开]",
+    "[不支持的消息XML结构，未展开]",
+})
+
+
+def _file_is_text(message: Message) -> bool:
+    return (
+        "\n" in message.content
+        or "\r" in message.content
+        or message.content.startswith(_APPMSG_TEXT_PREFIXES)
+        or message.content in _APPMSG_TEXT_NOTICES
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Markdown
 # --------------------------------------------------------------------------- #
+
+def _markdown_file_content(message: Message) -> str:
+    if _file_is_text(message):
+        # Hard breaks retain the canonical line boundaries in rendered Markdown
+        # too. Escape *before* adding our own syntax; URLs/HTML stay literal.
+        text = message.content.replace("\r\n", "\n").replace("\r", "\n")
+        return _escape_markdown(text).replace("\n", "  \n")
+    # Normal one-line FILE names/paths keep the historical attachment display.
+    return f"_[文件] {_markdown_inline(message.content)}_"
+
 
 def _markdown_text(
     conversation: Conversation,
@@ -565,7 +604,7 @@ def _markdown_text(
                     f"![图片](<{_markdown_destination(relative)}>)"
                 )
         elif message.type is MessageType.FILE:
-            lines.append(f"_[文件] {_markdown_inline(message.content)}_")
+            lines.append(_markdown_file_content(message))
         elif message.type is MessageType.VOICE:
             if materialize_media and message.transcript:
                 lines.append(_escape_markdown(message.transcript))
@@ -645,8 +684,13 @@ def _json_message(
             kind = MessageType.IMAGE
             content = relative
     elif kind is MessageType.FILE:
-        kind = MessageType.SYSTEM
-        content = f"[文件] {message.content}"
+        # v1 archives preserve canonical content/reply_to as plain text, not a
+        # new display tree. Ordinary attachments retain their safe placeholder.
+        if _file_is_text(message):
+            kind = MessageType.TEXT
+        else:
+            kind = MessageType.SYSTEM
+            content = f"[文件] {message.content}"
     elif kind is MessageType.VOICE:
         kind, content, duration_ms, transcript = _voice_or_placeholder(
             message, materialize_media
@@ -750,9 +794,20 @@ def _sanitize_for_pdf(
             else:
                 sanitized.append(_system_message(message, timestamp, _IMAGE_MISSING))
         elif message.type is MessageType.FILE:
-            sanitized.append(
-                _system_message(message, timestamp, f"[文件] {message.content}")
-            )
+            if _file_is_text(message):
+                # Vendor FILE rendering takes Path(content).name. Canonical
+                # cards/forwards are literal body text, so use a text bubble
+                # (also retaining the sender and optional reply relationship).
+                # PDF draws text into pixels; Markdown/HTML escapes do not
+                # belong here and would change the visible message.
+                sanitized.append(replace(
+                    message, timestamp=timestamp, type=MessageType.TEXT,
+                    audio_path=None, duration_ms=None, transcript=None,
+                ))
+            else:
+                sanitized.append(
+                    _system_message(message, timestamp, f"[文件] {message.content}")
+                )
         elif message.type is MessageType.VOICE:
             if materialize_media and message.transcript:
                 # The PDF renderer draws voice bubbles with a fixed label

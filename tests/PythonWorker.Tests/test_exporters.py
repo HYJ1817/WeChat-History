@@ -13,6 +13,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
+from xml.sax.saxutils import escape
 
 from PIL import Image
 
@@ -30,7 +31,9 @@ from wechat_context_exporter.models import (  # noqa: E402
 )
 from wechat_context_exporter.rendering.fonts import FontBook  # noqa: E402
 from wechat_memory import exporters  # noqa: E402
+from wechat_memory.appmsg_parser import parse_appmsg  # noqa: E402
 from wechat_memory.exporters import ExportError, export_conversation  # noqa: E402
+from wechat_memory.offline_import import load_json_file  # noqa: E402
 
 UTC8 = timezone(timedelta(hours=8))
 UTC = timezone.utc
@@ -85,6 +88,51 @@ def make_png(path: Path, size: tuple[int, int] = (24, 18)) -> Path:
 def unescape_markdown(text: str) -> str:
     """Undo the exporter's CommonMark backslash escaping to compare visible text."""
     return re.sub(r"\\([\\`*_{}\[\]()#+\-.!|>~<])", r"\1", text)
+
+
+def make_appmsg_messages() -> list[Message]:
+    """Project synthetic cards at the same FILE-model seam as the live source."""
+    def field(name: str, text: str) -> str:
+        return f"<{name}>{escape(text)}</{name}>"
+
+    def app(kind: int, title: str, extra: str = "") -> str:
+        return f"<appmsg><type>{kind}</type>{field('title', title)}{extra}</appmsg>"
+
+    quoted = "前" * 90 + "保留引文尾部 / 引用路径"
+    item = (
+        '<dataitem datatype="1"><dataitemsource><sourcename>内部发送者</sourcename>'
+        '<sourcetime>2026-11-28 09:01</sourcetime></dataitemsource>'
+        + field("datadesc", "重复条目\n![x](https://a.invalid/x)\n<script>literal</script>")
+        + "</dataitem>"
+    )
+    cards = {
+        "link": app(5, "**链接标题**", field("des", "第一行\n\n# 不是标题")
+                    + field("url", "https://a.invalid/path?a=1&b=2")),
+        "file-card": app(6, "附件标题", "<appattach>"
+                         + field("filename", r"C:\synthetic\报告`[1].pdf")
+                         + "<totallen>42</totallen></appattach>"),
+        "one-line-file-card": app(6, "只有文件名.pdf"),
+        "one-line-link": app(5, "只有链接标题"),
+        "quote": app(57, "当前回复", "<refermsg><type>1</type><svrid>123456789</svrid>"
+                     "<displayname>被引发送者</displayname>" + field("content", quoted)
+                     + "</refermsg>"),
+        "forward": app(19, "合并转发", "<recorditem><recordinfo><title>记录标题</title>"
+                       '<datalist count="2">' + item * 2
+                       + "</datalist></recordinfo></recorditem>"),
+        "unsupported": app(999, "未知卡片 / 保留标题"),
+        "untitled-unsupported": app(999, ""),
+        "invalid": "<appmsg>",
+        "unsupported-root": "<unrelated/>",
+        "rejected": '<!DOCTYPE appmsg SYSTEM "file:///do-not-open"><appmsg/>',
+    }
+    messages = []
+    for message_id, xml in cards.items():
+        projection = parse_appmsg(xml)
+        messages.append(make_message(
+            message_id, MessageType.FILE, projection.canonical_text,
+            reply_to=projection.reply_to, is_outgoing=message_id == "quote",
+        ))
+    return messages
 
 
 class ExportTestCase(unittest.TestCase):
@@ -230,6 +278,153 @@ class JsonTests(ExportTestCase):
         self.assertEqual(payload["version"], 1)
         self.assertEqual(payload["conversations"][0]["messages"], [])
         self.assertEqual(result.message_count, 0)
+
+
+class AppMessageExportTests(ExportTestCase):
+    def test_markdown_preserves_canonical_lines_as_escaped_text_with_media_on_or_off(self):
+        messages = make_appmsg_messages()
+        messages.append(make_message(
+            "multiline-file", MessageType.FILE,
+            "普通 FILE 正文\r\n第二行\r第三行\n\n[链接](javascript:never)\n<https://a.invalid/>",
+        ))
+        for media in (False, True):
+            with self.subTest(materialize_media=media):
+                output = self.folder / f"cards-{media}.md"
+                result = export_conversation(
+                    make_conversation(), messages, output, "markdown", materialize_media=media,
+                )
+                raw = output.read_text(encoding="utf-8")
+                visible = unescape_markdown(raw).replace("  \n", "\n")
+                for message in messages:
+                    expected = message.content.replace("\r\n", "\n").replace("\r", "\n")
+                    self.assertIn(expected, visible, message.id)
+                # The parser's label is not wrapped in another "file" label;
+                # each newline is a visible Markdown hard break, not a soft one.
+                self.assertIn("第一行  \n  \n\\# 不是标题", raw)
+                self.assertNotIn("_[文件]", raw)
+                self.assertNotRegex(raw, r"(?<!\\)<(?:script|https)")
+                self.assertNotIn("](https", raw)
+                self.assertNotIn("](javascript", raw)
+                self.assertNotIn("\n# 不是标题", raw)
+                self.assertEqual(visible.count("重复条目"), 2)
+                self.assertEqual(result.message_count, len(messages))
+                self.assertIsNone(result.assets_dir)
+
+    def test_json_v1_round_trips_canonical_content_and_reply_without_a_card_tree(self):
+        messages = make_appmsg_messages()
+        output = self.folder / "cards.json"
+        export_conversation(make_conversation(), messages, output, "json")
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], 1)
+        exported = payload["conversations"][0]["messages"]
+        for original, entry in zip(messages, exported):
+            with self.subTest(message_id=original.id):
+                self.assertEqual(entry["type"], "text")
+                self.assertEqual(entry["content"], original.content)
+                self.assertEqual(entry.get("reply_to"), original.reply_to)
+                expected_keys = {"id", "sender", "timestamp", "type", "content", "is_outgoing"}
+                if original.reply_to:
+                    expected_keys.add("reply_to")
+                self.assertEqual(set(entry), expected_keys)
+        restored = load_json_file(output).conversations[0]
+        rebuilt = [make_message(
+            item.id, MessageType(item.kind), item.content, sender=item.sender,
+            timestamp=item.timestamp, reply_to=item.reply_to, is_outgoing=item.is_outgoing,
+        ) for item in restored.messages]
+        self.assertEqual(
+            [(item.content, item.reply_to) for item in rebuilt],
+            [(item.content, item.reply_to) for item in messages],
+        )
+        second = self.folder / "cards-again.json"
+        export_conversation(make_conversation(), rebuilt, second, "json", materialize_media=False)
+        self.assertEqual(json.loads(second.read_text(encoding="utf-8")), payload)
+
+    def test_pdf_sanitizer_bypasses_file_basename_and_keeps_literal_canonical_text(self):
+        messages = make_appmsg_messages()
+        for media in (False, True):
+            sanitized = exporters._sanitize_for_pdf(messages, media)
+            for original, rendered in zip(messages, sanitized):
+                with self.subTest(message_id=original.id, materialize_media=media):
+                    self.assertEqual(rendered.type, MessageType.TEXT)
+                    self.assertEqual(rendered.content, original.content)
+                    self.assertEqual(rendered.reply_to, original.reply_to)
+                    # In particular, a URL or slash in the canonical body must
+                    # not reach the vendor FILE -> Path(content).name branch.
+                    with mock.patch(
+                        "wechat_context_exporter.rendering.chat.Path",
+                        side_effect=AssertionError("canonical content is not a path"),
+                    ):
+                        self.assertEqual(
+                            exporters.ChatRenderer._display_content(rendered), original.content,
+                        )
+                    self.assertIsNone(rendered.audio_path)
+
+    def test_ordinary_file_keeps_legacy_label_and_never_materializes_an_attachment(self):
+        source = self.folder / "report`[1].pdf"
+        source.write_bytes(b"synthetic attachment; do not copy")
+        contents = [str(source), source.name, "[链接].pdf", "[消息XML格式无效，未展开].pdf"]
+        messages = [make_message(f"ordinary-{i}", MessageType.FILE, content)
+                    for i, content in enumerate(contents)]
+        expected = [f"[文件] {content}" for content in contents]
+        output = self.folder / "ordinary.md"
+        markdown = export_conversation(make_conversation(), messages, output, "markdown")
+        raw = output.read_text(encoding="utf-8")
+        for content in expected:
+            self.assertIn(f"_{content}_", unescape_markdown(raw))
+        self.assertNotIn("](", raw)
+        self.assertIsNone(markdown.assets_dir)
+        output = self.folder / "ordinary.json"
+        result = export_conversation(make_conversation(), messages, output, "json")
+        exported = json.loads(output.read_text(encoding="utf-8"))["conversations"][0]["messages"]
+        self.assertEqual([(item["type"], item["content"]) for item in exported],
+                         [("system", content) for content in expected])
+        self.assertIsNone(result.assets_dir)
+        for media in (False, True):
+            sanitized = exporters._sanitize_for_pdf(messages, media)
+            self.assertEqual([(item.type, item.content) for item in sanitized],
+                             [(MessageType.SYSTEM, content) for content in expected])
+            self.assertEqual([exporters.ChatRenderer._display_content(item) for item in sanitized], expected)
+        self.assertEqual(source.read_bytes(), b"synthetic attachment; do not copy")
+
+    @unittest.skipUnless(FONT_AVAILABLE, "系统中没有可用于 PDF 的中文字体")
+    def test_pdf_draws_all_canonical_text_and_long_file_continuations_without_path_parsing(self):
+        messages = make_appmsg_messages()
+        messages.append(make_message(
+            "continuation", MessageType.FILE,
+            "\n".join(f"第{i:02d}行 / 保留正文" for i in range(45)),
+        ))
+        drawn: dict[str, list[str]] = {}
+        original_draw = exporters.ChatRenderer._draw_message
+
+        def record_draw(renderer, draw, page, block, y):
+            drawn.setdefault(block.message.id, []).extend(block.lines)
+            return original_draw(renderer, draw, page, block, y)
+
+        output = self.folder / "cards.pdf"
+        with mock.patch(
+            "wechat_context_exporter.rendering.chat.Path",
+            side_effect=AssertionError("body must never be interpreted as a path"),
+        ), mock.patch.object(
+            exporters.ChatRenderer, "_draw_message", autospec=True, side_effect=record_draw,
+        ), mock.patch.object(exporters, "_worker_temp_root", return_value=self.folder):
+            result = export_conversation(
+                make_conversation(), messages, output, "pdf", materialize_media=False,
+            )
+        self.assertTrue(output.read_bytes().startswith(b"%PDF"))
+        self.assertEqual(result.message_count, len(messages))
+        self.assertEqual(result.image_page_count, 0)
+        self.assertGreater(result.chat_page_count, 1)
+        for message in messages:
+            # Wrapping can split a long source line, but may not discard any
+            # non-whitespace text, path prefixes, literal HTML or link syntax.
+            self.assertEqual(
+                "".join("".join(drawn[message.id]).split()),
+                "".join(message.content.split()), message.id,
+            )
+        self.assertIn("", drawn["link"])
+        self.assertIn("# 不是标题", drawn["link"])
+        self.assertEqual(drawn["forward"].count("重复条目"), 2)
+        self.assertEqual(drawn["continuation"], messages[-1].content.split("\n"))
 
 
 class ImageTests(ExportTestCase):

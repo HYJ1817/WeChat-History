@@ -21,7 +21,7 @@ import tempfile
 import time as _time
 import traceback
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Callable
@@ -53,9 +53,18 @@ from wechat_context_exporter.models import (  # noqa: E402
     MessageType,
 )
 from wechat_context_exporter.text_exporters import export_json, export_markdown  # noqa: E402
+from wechat_memory.global_search import (  # noqa: E402
+    KEYWORD_SESSION_PREFIX, MAX_QUERY_BYTES, SOFT_DEADLINE_SECONDS,
+    KeywordPageCache, KeywordSearchCriteria, SearchCache, SearchDocument, SearchError,
+    bounded_context, content_fingerprint, datetime_microseconds, scan_documents,
+    scan_keyword_documents, search_page,
+)
+from wechat_memory.memory_paging import ImmutableMessagePageProvider  # noqa: E402
 from wechat_memory.offline_import import (  # noqa: E402
     ImportedJson,
+    JsonMessage,
     OfflineImportError,
+    OfflineJsonPageProvider,
     load_json_file,
 )
 
@@ -87,6 +96,19 @@ class DemoConversation:
     messages: tuple[DemoMessage, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _MemoryLocator:
+    conversation_id: str
+    index: int
+
+
+@dataclass(frozen=True, slots=True)
+class _KeywordPageState:
+    source: str
+    criteria: KeywordSearchCriteria
+    generations: Any
+
+
 @dataclass(frozen=True)
 class _PrunePreviewToken:
     days: int
@@ -109,6 +131,14 @@ class Context:
         # half-updated active source and message content cannot become a path.
         self.offline: ImportedJson | None = None
         self.offline_path: str | None = None
+        self.offline_page_provider: OfflineJsonPageProvider | None = None
+        self.active_source = "demo"
+        self.source_session_id = secrets.token_urlsafe(24)
+        self.demo_search_snapshot: tuple[DemoConversation, ...] | None = None
+        self.demo_page_provider: ImmutableMessagePageProvider[DemoMessage] | None = None
+        self.search_cache = SearchCache()
+        self.keyword_page_cache = KeywordPageCache()
+        self.keyword_page_states: dict[str, _KeywordPageState] = {}
         self.progress: Callable[[int, int, str], None] | None = None
         self.request_id: str = ""
         # Confirmation snapshots are deliberately process-local, bounded, and
@@ -274,8 +304,41 @@ def _bool_arg(payload: dict[str, Any], key: str, default: bool = False) -> bool:
 
 def _source_kind(payload: dict[str, Any]) -> str:
     source = payload.get("source", "demo")
-    if source not in {"demo", "wechat4", "offline"}:
+    if not isinstance(source, str) or source not in {"demo", "wechat4", "offline"}:
         raise WorkerError("SOURCE_NOT_FOUND", "当前版本不支持此数据源。")
+    return source
+
+
+def _clear_keyword_pages(context: Context) -> None:
+    context.keyword_page_cache.clear()
+    context.keyword_page_states.clear()
+
+
+def _activate_source(context: Context, source: str, *, force: bool = False) -> str:
+    if context.active_source != source or force:
+        if context.active_source == "offline" and context.offline_page_provider is not None:
+            context.offline_page_provider.invalidate()
+        if context.demo_page_provider is not None:
+            context.demo_page_provider.close()
+            context.demo_page_provider = None
+        context.search_cache.clear()
+        _clear_keyword_pages(context)
+        context.source_session_id = secrets.token_urlsafe(24)
+        context.active_source = source
+        context.demo_search_snapshot = None
+    return context.source_session_id
+
+
+def _require_search_source(payload: dict[str, Any], context: Context) -> str:
+    source = _source_kind(payload)
+    token = payload.get("sourceSessionId")
+    if (not isinstance(token, str) or not token or len(token) > 128
+            or token != context.source_session_id or source != context.active_source):
+        raise WorkerError("SOURCE_SESSION_CHANGED", "数据源已切换或会话已失效，请刷新后重新搜索。")
+    if source == "wechat4":
+        _require_wechat(context)
+    elif source == "offline":
+        _offline_conversations(context)
     return source
 
 
@@ -329,7 +392,16 @@ def _offline_message_json(item: Any) -> dict[str, Any]:
     return result
 
 
-def _real_message_json(item: Message) -> dict[str, Any]:
+def _app_message_projection_json(projection: Any) -> dict[str, Any]:
+    """Use the live source's bounded serializer without extending vendor models."""
+    try:
+        from wechat_memory.wechat4_source import app_message_projection_json
+        return app_message_projection_json(projection)
+    except (ImportError, ValueError):
+        raise WorkerError("PAGE_RESPONSE_INVALID", "消息投影结构无效。") from None
+
+
+def _real_message_json(item: Message, projection: Any = None) -> dict[str, Any]:
     content = item.content
     attachment: str | None = None
     if item.type is MessageType.IMAGE:
@@ -349,6 +421,10 @@ def _real_message_json(item: Message) -> dict[str, Any]:
         result["durationMs"] = item.duration_ms
     if item.transcript:
         result["transcript"] = item.transcript
+    if item.reply_to:
+        result["replyTo"] = item.reply_to
+    if projection is not None:
+        result.update(_app_message_projection_json(projection))
     return result
 
 
@@ -409,17 +485,72 @@ def _real_export_models(context: Context, payload: dict[str, Any]) -> tuple[Conv
 # Commands
 # --------------------------------------------------------------------------- #
 
+def _cursor_pagination_supported(source: str) -> bool:
+    """Whether a source mode implements both halves of the cursor protocol."""
+    if source == "offline":
+        source_type = OfflineJsonPageProvider
+    elif source == "demo":
+        source_type = ImmutableMessagePageProvider
+    elif source == "wechat4":
+        try:
+            from wechat_memory.wechat4_source import WeChat4Source
+        except ImportError:
+            return False
+        source_type = WeChat4Source
+    else:
+        return False
+    return all(callable(getattr(source_type, name, None)) for name in (
+        "get_messages_page", "get_messages_cursor_page",
+    ))
+
+
+def _keyword_pagination_supported(source: str) -> bool:
+    if source in {"demo", "offline"}:
+        # Validated in-memory models already support the legacy preview
+        # predicate and display projection. No media references are opened.
+        return True
+    if source == "wechat4":
+        try:
+            from wechat_memory.wechat4_source import WeChat4Source
+        except ImportError:
+            return False
+        return all(callable(getattr(WeChat4Source, name, None)) for name in (
+            "iter_keyword_documents", "validate_keyword_generations", "keyword_media_selection",
+        ))
+    return False
+
+
+def _source_capabilities() -> dict[str, list[str]]:
+    result = {}
+    for source in ("demo", "wechat4", "offline"):
+        capabilities = []
+        if _cursor_pagination_supported(source):
+            capabilities.append("message_cursor_pagination")
+        if _keyword_pagination_supported(source):
+            capabilities.append("message_keyword_pagination")
+        result[source] = capabilities
+    return result
+
+
 def handle_hello(payload: dict[str, Any], context: Context) -> dict[str, Any]:
+    source_capabilities = _source_capabilities()
+    capabilities = [
+        "demo", "wechat4", "offline_json", "accounts", "message_search", "message_pagination",
+        "markdown_export", "json_export", "pdf_export", "png_pages",
+        "image_recovery", "voice_transcribe", "tasks", "scenes", "delivery",
+        "progress_events", "global_message_search", "message_context",
+    ]
+    for capability in ("message_cursor_pagination", "message_keyword_pagination"):
+        if any(capability in items for items in source_capabilities.values()):
+            capabilities.append(capability)
     return {
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": [
-            "demo", "wechat4", "offline_json", "accounts", "message_search", "message_pagination",
-            "markdown_export", "json_export", "pdf_export", "png_pages",
-            "image_recovery", "voice_transcribe", "tasks", "scenes", "delivery",
-            "progress_events",
-        ],
+        "capabilities": capabilities,
+        "sourceCapabilities": source_capabilities,
         "timezone": TIMEZONE_LABEL,
         "pageSizeLimit": MAX_PAGE_SIZE,
+        "sourceSessionId": context.source_session_id,
+        "source": context.active_source,
     }
 
 
@@ -445,41 +576,48 @@ def handle_connect(payload: dict[str, Any], context: Context) -> dict[str, Any]:
         raise WorkerError("INVALID_ARGUMENT", "只有微信数据源需要连接。")
     from wechat_memory.wechat4_source import SourceFailure, WeChat4Source
 
-    if context.wechat is not None:
-        try:
-            context.wechat.close()
-        except Exception:
-            pass
-        context.wechat = None
     token = payload.get("accountToken")
     if token is not None and not isinstance(token, str):
         raise WorkerError("INVALID_ARGUMENT", "accountToken 必须是字符串。")
+    enable_images = _bool_arg(payload, "enableImages", False)
+    enable_voice = _bool_arg(payload, "enableVoice", False)
     source = WeChat4Source()
     try:
         result = source.connect(
             token,
-            enable_images=_bool_arg(payload, "enableImages", False),
-            enable_voice=_bool_arg(payload, "enableVoice", False),
+            enable_images=enable_images,
+            enable_voice=enable_voice,
             progress=context.emit_progress,
             cancelled=lambda: False,
         )
     except SourceFailure as error:
         source.close()
         raise WorkerError(error.code, error.message, error.retryable)
+    except Exception:
+        source.close()
+        raise WorkerError("WECHAT_CONNECT_FAILED", "连接微信失败，原数据源未切换。", True) from None
+    previous = context.wechat
+    if previous is not None:
+        previous.close()
     context.wechat = source
+    session_id = _activate_source(context, "wechat4", force=True)
     return {
         "connected": True,
         "source": "wechat4",
+        "sourceSessionId": session_id,
         **result,
         "capabilities": source.capabilities,
     }
 
 
 def handle_disconnect(payload: dict[str, Any], context: Context) -> dict[str, Any]:
-    if context.wechat is not None:
-        context.wechat.close()
+    try:
+        if context.wechat is not None:
+            context.wechat.close()
+    finally:
         context.wechat = None
-    return {"connected": False}
+        _activate_source(context, "demo", force=True)
+    return {"connected": False, "sourceSessionId": context.source_session_id}
 
 
 def handle_import_json(payload: dict[str, Any], context: Context) -> dict[str, Any]:
@@ -502,8 +640,14 @@ def handle_import_json(payload: dict[str, Any], context: Context) -> dict[str, A
     context.wechat = None
     context.offline = candidate
     context.offline_path = raw_path
+    if context.offline_page_provider is None:
+        context.offline_page_provider = OfflineJsonPageProvider(candidate)
+    else:
+        context.offline_page_provider.replace_snapshot(candidate)
+    session_id = _activate_source(context, "offline", force=True)
     return {
         "source": "offline",
+        "sourceSessionId": session_id,
         "schema": candidate.schema,
         "conversationCount": len(candidate.conversations),
         "messageCount": candidate.message_count,
@@ -517,8 +661,12 @@ def handle_list_conversations(payload: dict[str, Any], context: Context) -> dict
         raise WorkerError("INVALID_ARGUMENT", "query 必须是字符串。")
     if source_name == "demo":
         conversations = load_demo(context.demo_path)
+        session_id = _activate_source(context, "demo")
+        if context.demo_search_snapshot is None:
+            context.demo_search_snapshot = tuple(conversations)
         needle = (query or "").casefold()
         return {
+            "sourceSessionId": session_id,
             "items": [
                 {"id": item.id, "title": item.title, "messageCount": len(item.messages),
                  "kind": item.kind, "countKnown": True}
@@ -528,8 +676,10 @@ def handle_list_conversations(payload: dict[str, Any], context: Context) -> dict
         }
     if source_name == "offline":
         conversations = _offline_conversations(context)
+        session_id = _activate_source(context, "offline")
         needle = (query or "").casefold()
         return {
+            "sourceSessionId": session_id,
             "items": [
                 {"id": item.id, "title": item.title, "messageCount": len(item.messages),
                  "kind": item.kind, "countKnown": True}
@@ -539,7 +689,9 @@ def handle_list_conversations(payload: dict[str, Any], context: Context) -> dict
         }
     source = _require_wechat(context)
     items = source.list_conversations(query)
+    session_id = _activate_source(context, "wechat4")
     return {
+        "sourceSessionId": session_id,
         "items": [
             {"id": item.id, "title": item.name, "messageCount": 0,
              "kind": item.kind.value, "countKnown": False}
@@ -588,11 +740,547 @@ def handle_get_messages(payload: dict[str, Any], context: Context) -> dict[str, 
     conversation, page = _real_messages(
         context, payload.get("conversationId", ""), start, end, query, offset, limit, order
     )
+    projections = getattr(page, "projections", ())
     return {
-        "items": [_real_message_json(item) for item in page.items],
+        "items": [
+            _real_message_json(item, projections[index] if index < len(projections) else None)
+            for index, item in enumerate(page.items)
+        ],
         "total": page.total,
         "nextOffset": page.next_offset,
     }
+
+
+# --------------------------------------------------------------------------- #
+# B2 cursors / B3 completed keyword snapshots: preview-only message pages
+# --------------------------------------------------------------------------- #
+
+_CURSOR_REQUEST_KEYS = {
+    "source", "sourceSessionId", "conversationId", "startDate", "endDate", "query", "order",
+    "limit", "pageSessionId", "cursor",
+}
+
+
+def _cursor_token(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip() or len(value) > 256:
+        raise WorkerError("INVALID_ARGUMENT", f"{key} 必须是有效的分页标识。")
+    return value
+
+
+def _require_cursor_source(payload: dict[str, Any], context: Context):
+    if "source" not in payload:
+        raise WorkerError("INVALID_ARGUMENT", "source 必须明确指定。")
+    source_name = _source_kind(payload)
+    source_session_id = _cursor_token(payload, "sourceSessionId")
+    if source_name != context.active_source or source_session_id != context.source_session_id:
+        raise WorkerError("SOURCE_SESSION_CHANGED", "数据源已切换或会话已失效，请刷新后重试。")
+    if not _cursor_pagination_supported(source_name):
+        raise WorkerError("CAPABILITY_UNAVAILABLE", "当前数据源不支持稳定游标分页。")
+    if source_name == "wechat4":
+        source = _require_wechat(context)
+    elif source_name == "offline":
+        source = context.offline_page_provider
+        if source is None:
+            raise WorkerError("CAPABILITY_UNAVAILABLE", "当前数据源不支持稳定游标分页。")
+    elif source_name == "demo":
+        if context.demo_page_provider is None:
+            context.demo_page_provider = ImmutableMessagePageProvider(
+                _memory_search_conversations(context, "demo"),
+            )
+        source = context.demo_page_provider
+    else:
+        raise WorkerError("CAPABILITY_UNAVAILABLE", "当前数据源不支持稳定游标分页。")
+    if not all(callable(getattr(source, name, None)) for name in (
+        "get_messages_page", "get_messages_cursor_page",
+    )):
+        raise WorkerError("CAPABILITY_UNAVAILABLE", "当前数据源不支持稳定游标分页。")
+    return source_name, source
+
+
+def _invoke_cursor_method(method: Callable[..., Any], *args: Any, **kwargs: Any):
+    try:
+        return method(*args, **kwargs)
+    except WorkerError:
+        raise
+    except Exception as error:  # noqa: BLE001 - source failures have fixed public errors
+        code = getattr(error, "code", None)
+        message = getattr(error, "message", None)
+        if isinstance(code, str) and isinstance(message, str):
+            raise WorkerError(code, message, bool(getattr(error, "retryable", False))) from None
+        raise WorkerError("PAGE_READ_FAILED", "读取消息页失败，请重试。", True) from None
+
+
+def _page_response_token(value: Any, label: str, *, optional: bool = False) -> str | None:
+    if optional and value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 256:
+        raise WorkerError("PAGE_RESPONSE_INVALID", f"消息分页服务返回了无效的 {label}。")
+    return value
+
+
+def _cursor_page_result(
+    page: Any,
+    limit: int,
+    expected_session_id: str | None = None,
+    *,
+    first_page: bool = False,
+) -> dict[str, Any]:
+    items = getattr(page, "items", None)
+    total = getattr(page, "total", None)
+    if not isinstance(items, (tuple, list)) or len(items) > limit:
+        raise WorkerError("PAGE_RESPONSE_INVALID", "消息分页服务返回了超出限制的页面。")
+    if type(total) is not int or not 0 <= total <= (1 << 63) - 1 or len(items) > total:
+        raise WorkerError("PAGE_RESPONSE_INVALID", "消息分页服务返回了无效的总数。")
+    page_session_id = _page_response_token(getattr(page, "page_session_id", None), "pageSessionId")
+    if expected_session_id is not None and page_session_id != expected_session_id:
+        raise WorkerError("PAGE_RESPONSE_INVALID", "消息分页服务返回了不匹配的会话标识。")
+    previous_cursor = _page_response_token(
+        getattr(page, "previous_cursor", None), "previousCursor", optional=True,
+    )
+    next_cursor = _page_response_token(getattr(page, "next_cursor", None), "nextCursor", optional=True)
+    if getattr(page, "sort_version", None) != "precise-v1":
+        raise WorkerError("PAGE_RESPONSE_INVALID", "消息分页服务返回了不支持的排序版本。")
+    if total and not items:
+        raise WorkerError("PAGE_RESPONSE_INVALID", "消息分页服务返回了空白页面。")
+    if previous_cursor is not None and previous_cursor == next_cursor:
+        raise WorkerError("PAGE_RESPONSE_INVALID", "消息分页服务返回了重复的游标。")
+    if not items and (previous_cursor is not None or next_cursor is not None):
+        raise WorkerError("PAGE_RESPONSE_INVALID", "空消息页不能包含游标。")
+    if first_page and (
+        previous_cursor is not None or (next_cursor is not None) != (total > len(items))
+    ):
+        raise WorkerError("PAGE_RESPONSE_INVALID", "首屏游标边界与消息总数不一致。")
+
+    serialized_items: list[dict[str, Any]] = []
+    for item in items:
+        projection = None
+        candidate = item
+        if not isinstance(candidate, (Message, JsonMessage, DemoMessage)):
+            candidate = getattr(item, "message", None)
+            projection = getattr(item, "projection", None)
+        common_valid = (
+            isinstance(candidate, (Message, JsonMessage, DemoMessage))
+            and isinstance(candidate.id, str) and bool(candidate.id)
+            and isinstance(candidate.sender, str) and isinstance(candidate.content, str)
+            and isinstance(candidate.timestamp, datetime) and candidate.timestamp.tzinfo is not None
+            and candidate.timestamp.utcoffset() is not None
+        )
+        if isinstance(candidate, (Message, JsonMessage)):
+            common_valid = common_valid and (
+                isinstance(candidate.is_outgoing, bool)
+                and (candidate.duration_ms is None or (
+                    type(candidate.duration_ms) is int and 0 <= candidate.duration_ms <= 2_147_483_647
+                ))
+                and (candidate.transcript is None or isinstance(candidate.transcript, str))
+                and (candidate.reply_to is None or isinstance(candidate.reply_to, str))
+            )
+        if isinstance(candidate, Message):
+            valid = common_valid and isinstance(candidate.type, MessageType)
+            serialized = _real_message_json(candidate, projection) if valid else None
+        elif isinstance(candidate, JsonMessage):
+            valid = common_valid and candidate.kind in _MESSAGE_KINDS and projection is None
+            serialized = _offline_message_json(candidate) if valid else None
+        elif isinstance(candidate, DemoMessage):
+            valid = common_valid and candidate.kind in _MESSAGE_KINDS and projection is None
+            serialized = _demo_message_json(candidate) if valid else None
+        else:
+            valid = False
+            serialized = None
+        if not valid or serialized is None:
+            raise WorkerError("PAGE_RESPONSE_INVALID", "消息分页服务返回了无效的消息结构。")
+        serialized_items.append(serialized)
+
+    result = {
+        "items": serialized_items,
+        "total": total,
+        "pageSessionId": page_session_id,
+        "previousCursor": previous_cursor,
+        "nextCursor": next_cursor,
+        "sortVersion": "precise-v1",
+    }
+    try:
+        size = len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError, UnicodeEncodeError):
+        raise WorkerError("PAGE_RESPONSE_INVALID", "消息分页服务返回了无法编码的页面。") from None
+    # Reserve enough space for the JSON-lines envelope, including the maximum
+    # accepted requestId, so the complete response stays below the line limit.
+    if size > MAX_REQUEST_BYTES - 2048:
+        raise WorkerError("PAGE_RESPONSE_TOO_LARGE", "消息页超过协议大小上限，请缩小每页条数。")
+    return result
+
+
+def handle_get_messages_page(payload: dict[str, Any], context: Context) -> dict[str, Any]:
+    unknown = set(payload) - _CURSOR_REQUEST_KEYS
+    if unknown:
+        raise WorkerError("INVALID_ARGUMENT", "分页请求包含不支持的字段。")
+    continuation = "pageSessionId" in payload or "cursor" in payload
+    allowed = (
+        {"source", "sourceSessionId", "pageSessionId", "cursor", "limit"}
+        if continuation else
+        {"source", "sourceSessionId", "conversationId", "startDate", "endDate", "query", "order", "limit"}
+    )
+    if set(payload) - allowed:
+        page_id = payload.get("pageSessionId")
+        if isinstance(page_id, str) and page_id.startswith(KEYWORD_SESSION_PREFIX):
+            raise WorkerError("PAGE_CRITERIA_CHANGED", "关键词续页不能更改会话或筛选条件，请重新查询。", True)
+        raise WorkerError("INVALID_ARGUMENT", "续页请求不能更改会话或筛选条件。")
+    limit = _int_arg(payload, "limit", DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE)
+    if continuation:
+        page_session_id = _cursor_token(payload, "pageSessionId")
+        cursor = _cursor_token(payload, "cursor")
+        if page_session_id.startswith(KEYWORD_SESSION_PREFIX):
+            source_name = _require_keyword_source(payload, context)
+            return _continue_keyword_page(context, source_name, page_session_id, cursor, limit)
+    elif payload.get("query") is not None:
+        source_name = _require_keyword_source(payload, context)
+        return _first_keyword_page(payload, context, source_name, limit)
+
+    _source_name, source = _require_cursor_source(payload, context)
+    if continuation:
+        page = _invoke_cursor_method(
+            source.get_messages_cursor_page,
+            context.source_session_id,
+            page_session_id,
+            cursor,
+            limit=limit,
+        )
+        return _cursor_page_result(page, limit, page_session_id)
+
+    conversation_id = payload.get("conversationId")
+    if not isinstance(conversation_id, str) or not conversation_id.strip() or len(conversation_id) > 1024:
+        raise WorkerError("INVALID_ARGUMENT", "conversationId 必须是有效的会话标识。")
+    start = _date_arg(payload, "startDate")
+    end = _date_arg(payload, "endDate")
+    lower, upper = inclusive_bounds(start, end)
+    order = payload.get("order", "desc")
+    if not isinstance(order, str) or order not in {"asc", "desc"}:
+        raise WorkerError("INVALID_ARGUMENT", "order 必须是 asc 或 desc。")
+    page = _invoke_cursor_method(
+        source.get_messages_page,
+        conversation_id,
+        source_session_id=context.source_session_id,
+        start_epoch=int(lower.timestamp()) if lower else None,
+        end_epoch_exclusive=int(upper.timestamp()) if upper else None,
+        order=order,
+        limit=limit,
+    )
+    return _cursor_page_result(page, limit, first_page=True)
+
+
+def _require_keyword_source(payload: dict[str, Any], context: Context) -> str:
+    if "source" not in payload:
+        raise WorkerError("INVALID_ARGUMENT", "source 必须明确指定。")
+    source_name = _source_kind(payload)
+    source_session_id = _cursor_token(payload, "sourceSessionId")
+    if source_name != context.active_source or source_session_id != context.source_session_id:
+        raise WorkerError("SOURCE_SESSION_CHANGED", "数据源已切换或会话已失效，请刷新后重试。")
+    if not _keyword_pagination_supported(source_name):
+        raise WorkerError("CAPABILITY_UNAVAILABLE", "当前数据源不支持关键词快照分页。")
+    if source_name == "wechat4":
+        _require_wechat(context)
+    elif source_name == "offline":
+        _offline_conversations(context)
+    return source_name
+
+
+def _keyword_media_selection(context: Context, source: str) -> dict[str, Any]:
+    if source == "wechat4":
+        return _require_wechat(context).keyword_media_selection()
+    return {"recoverImages": False, "recoverVoice": False, "projection": "legacy-memory-preview"}
+
+
+def _memory_keyword_generations(context: Context, source: str) -> dict[str, Any]:
+    snapshot = context.offline if source == "offline" else context.demo_search_snapshot
+    return {
+        "sourceSessionId": context.source_session_id, "snapshot": id(snapshot),
+        "revision": context.offline_page_provider.generation
+        if source == "offline" and context.offline_page_provider is not None else 0,
+    }
+
+
+def _memory_keyword_documents(conversation: Any, source: str, lower: datetime | None,
+                              upper: datetime | None, deadline: float):
+    for index, item in enumerate(conversation.messages):
+        if _time.monotonic() >= deadline:
+            raise SearchError("SEARCH_BUDGET_EXCEEDED", "关键词检索超过时间预算，请缩小日期范围。", True)
+        if (lower is not None and item.timestamp < lower) or (upper is not None and item.timestamp >= upper):
+            continue
+        # Preserve _filter_query's predicate over the imported content, but
+        # cache the existing wire display (images remain safe placeholders).
+        # Hidden transcript metadata is NOT a separate legacy match field.
+        message = _offline_message_json(item) if source == "offline" else _demo_message_json(item)
+        message["timestamp"] = item.timestamp.isoformat(timespec="microseconds")
+        yield SearchDocument(
+            {"id": conversation.id, "title": conversation.title, "kind": conversation.kind},
+            message, (datetime_microseconds(item.timestamp), conversation.id, "memory", "messages", index),
+            _MemoryLocator(conversation.id, index),
+            content_fingerprint(item.id, item.sender, item.timestamp.isoformat(), item.kind, item.content,
+                                getattr(item, "transcript", None), getattr(item, "reply_to", None)),
+            keyword_content=item.content,
+        )
+
+
+def _prune_keyword_states(context: Context) -> None:
+    context.keyword_page_cache.purge()
+    for page_id in list(context.keyword_page_states):
+        if page_id not in context.keyword_page_cache.sessions:
+            del context.keyword_page_states[page_id]
+
+
+def _first_keyword_page(payload: dict[str, Any], context: Context, source: str, limit: int) -> dict[str, Any]:
+    query = payload.get("query")
+    if not isinstance(query, str):
+        raise WorkerError("INVALID_ARGUMENT", "query 必须是字符串或 null。")
+    try:
+        if len(query.encode("utf-8")) > MAX_QUERY_BYTES:
+            raise WorkerError("INVALID_ARGUMENT", "搜索关键词超过长度上限。")
+    except UnicodeEncodeError:
+        raise WorkerError("INVALID_ARGUMENT", "搜索关键词包含无效字符。") from None
+    # Empty/whitespace strings intentionally keep legacy literal semantics;
+    # only JSON null (or an omitted query) selects ordinary B2 pagination.
+    conversation_id = payload.get("conversationId")
+    if not isinstance(conversation_id, str) or not conversation_id.strip() or len(conversation_id) > 1024:
+        raise WorkerError("INVALID_ARGUMENT", "conversationId 必须是有效的会话标识。")
+    start, end = _date_arg(payload, "startDate"), _date_arg(payload, "endDate")
+    lower, upper = inclusive_bounds(start, end)
+    order = payload.get("order", "desc")
+    if not isinstance(order, str) or order not in {"asc", "desc"}:
+        raise WorkerError("INVALID_ARGUMENT", "order 必须是 asc 或 desc。")
+    criteria = KeywordSearchCriteria(
+        query, start.isoformat() if start else None, end.isoformat() if end else None, order,
+        conversation_id=conversation_id, media_selection=_keyword_media_selection(context, source),
+    )
+    deadline = _time.monotonic() + SOFT_DEADLINE_SECONDS
+    generations: Any = {}
+    if source == "wechat4":
+        documents = _require_wechat(context).iter_keyword_documents(
+            conversation_id, int(lower.timestamp()) if lower else None, int(upper.timestamp()) if upper else None,
+            deadline=deadline, generations=generations,
+        )
+    else:
+        conversation = _find_demo_conversation(_memory_search_conversations(context, source), payload)
+        generations = _memory_keyword_generations(context, source)
+        documents = _memory_keyword_documents(conversation, source, lower, upper, deadline)
+    _prune_keyword_states(context)
+    context.emit_progress(0, 1, "正在完整匹配当前会话；首次查询可能需要较长时间")
+    entries, total, candidates = scan_keyword_documents(
+        documents, query, order, deadline=deadline, max_candidates=MAX_EXPORT_MESSAGES,
+    )
+    session = context.keyword_page_cache.create(
+        source, context.source_session_id, entries, total, candidates, generations, criteria,
+    )
+    context.keyword_page_states[session.page_session_id] = _KeywordPageState(source, criteria, generations)
+    _prune_keyword_states(context)
+    try:
+        result = _continue_keyword_page(context, source, session.page_session_id, None, limit)
+    except Exception:
+        context.keyword_page_cache.discard(session.page_session_id)
+        context.keyword_page_states.pop(session.page_session_id, None)
+        raise
+    context.emit_progress(1, 1, "关键词匹配已完成，后续翻页使用内存快照")
+    return result
+
+
+def _continue_keyword_page(context: Context, source: str, page_session_id: str,
+                           cursor: str | None, limit: int) -> dict[str, Any]:
+    _prune_keyword_states(context)
+    state = context.keyword_page_states.get(page_session_id)
+    if state is None:
+        raise WorkerError("PAGE_EXPIRED", "关键词分页已过期或被释放，请重新查询。", True)
+    try:
+        if source == "wechat4":
+            _require_wechat(context).validate_keyword_generations(state.generations)
+            generations = state.generations
+        else:
+            generations = _memory_keyword_generations(context, source)
+        criteria = replace(state.criteria, media_selection=_keyword_media_selection(context, source))
+        return context.keyword_page_cache.cursor_page(
+            page_session_id, source, context.source_session_id, generations, criteria, cursor=cursor, limit=limit,
+        )
+    except Exception:
+        # A changed/unreadable source or changed criteria must not leave a
+        # usable old session behind; the next attempt is explicitly expired.
+        context.keyword_page_cache.discard(page_session_id)
+        context.keyword_page_states.pop(page_session_id, None)
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# Global search v1: fixed in-memory results and bounded verified context
+# --------------------------------------------------------------------------- #
+
+
+def _memory_search_conversations(context: Context, source: str):
+    if source == "offline":
+        return _offline_conversations(context)
+    if context.demo_search_snapshot is None:
+        context.demo_search_snapshot = tuple(load_demo(context.demo_path))
+    return context.demo_search_snapshot
+
+
+def _memory_search_document(conversation: Any, item: Any, index: int) -> SearchDocument:
+    message = _demo_message_json(item)
+    message["timestamp"] = item.timestamp.isoformat(timespec="microseconds")
+    if item.kind == "image":
+        message["content"] = "[图片]"
+    elif item.kind in {"voice", "file"} and re.match(r"^(?:[A-Za-z]:[\\/]|\\\\|/|file:|https?://)", item.content):
+        # JSON media references are metadata, not searchable local paths. This
+        # is string handling only: never stat/open a referenced file or URL.
+        message["content"] = "[语音消息]" if item.kind == "voice" else "[文件] " + re.split(r"[\\/]", item.content)[-1]
+    transcript = getattr(item, "transcript", None)
+    if transcript:
+        message["transcript"] = transcript
+    reply = getattr(item, "reply_to", None)
+    if reply:
+        message["replyTo"] = reply
+    duration = getattr(item, "duration_ms", None)
+    if duration is not None:
+        message["durationMs"] = duration
+    fingerprint = content_fingerprint(item.id, item.sender, item.timestamp.isoformat(), item.kind,
+                                      item.content, transcript, reply)
+    return SearchDocument(
+        {"id": conversation.id, "title": conversation.title, "kind": conversation.kind,
+         "messageCount": len(conversation.messages), "countKnown": True},
+        message, (datetime_microseconds(item.timestamp), conversation.id, "memory", "messages", index),
+        _MemoryLocator(conversation.id, index), fingerprint,
+    )
+
+
+def _memory_search_documents(context: Context, source: str, lower: datetime | None, upper: datetime | None,
+                             deadline: float):
+    for conversation in _memory_search_conversations(context, source):
+        for index, item in enumerate(conversation.messages):
+            if _time.monotonic() >= deadline:
+                raise SearchError("SEARCH_BUDGET_EXCEEDED", "搜索超过时间预算，请缩小日期范围。", True)
+            if (lower is None or item.timestamp >= lower) and (upper is None or item.timestamp < upper):
+                yield _memory_search_document(conversation, item, index)
+
+
+def _search_token(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip() or len(value) > 128:
+        raise WorkerError("INVALID_ARGUMENT", f"{key} 必须是有效的服务端标识。")
+    return value
+
+
+def _search_session(payload: dict[str, Any], context: Context, source: str):
+    session = context.search_cache.get(_search_token(payload, "searchId"), source, context.source_session_id)
+    if source == "wechat4":
+        try:
+            _require_wechat(context).validate_search_generations(session.generations)
+        except Exception:
+            context.search_cache.discard(session.search_id)
+            raise
+    return session
+
+
+def _attach_live_search_projections(hits: tuple[Any, ...]) -> None:
+    """Move bounded C3 metadata from hit locators into the cached hit summaries."""
+    for hit in hits:
+        slot = getattr(hit.locator, "projection_slot", None)
+        if slot is None:
+            continue
+        projection = getattr(slot, "projection", None)
+        if projection is not None:
+            if not isinstance(projection, dict):
+                raise WorkerError("PAGE_RESPONSE_INVALID", "消息投影结构无效。")
+            hit.item.update(projection)
+            # The hit item is included in SearchCache's byte accounting. Release
+            # the temporary duplicate held only to bridge scan_documents' summary.
+            slot.projection = None
+
+
+def handle_search_messages(payload: dict[str, Any], context: Context) -> dict[str, Any]:
+    source = _require_search_source(payload, context)
+    offset = _int_arg(payload, "offset", 0, 0, 1_000_000_000)
+    limit = _int_arg(payload, "limit", DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE)
+    common = {"source", "sourceSessionId", "searchId", "offset", "limit"}
+    if "searchId" in payload:
+        if set(payload) - common:
+            raise WorkerError("INVALID_ARGUMENT", "搜索续页不能混入新的关键词、日期或排序条件。")
+        return search_page(_search_session(payload, context, source), offset, limit)
+    if set(payload) - (common | {"query", "startDate", "endDate", "order"}):
+        raise WorkerError("INVALID_ARGUMENT", "全局搜索包含不受支持的条件。")
+    if offset != 0:
+        raise WorkerError("INVALID_ARGUMENT", "首次搜索的 offset 必须为 0。")
+    query = payload.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise WorkerError("INVALID_ARGUMENT", "请输入非空的搜索关键词。")
+    try:
+        if len(query.encode("utf-8")) > MAX_QUERY_BYTES:
+            raise WorkerError("INVALID_ARGUMENT", "搜索关键词超过长度上限。")
+    except UnicodeEncodeError:
+        raise WorkerError("INVALID_ARGUMENT", "搜索关键词包含无效字符。") from None
+    order = payload.get("order", "desc")
+    if not isinstance(order, str) or order not in {"asc", "desc"}:
+        raise WorkerError("INVALID_ARGUMENT", "order 必须是 asc 或 desc。")
+    lower, upper = inclusive_bounds(_date_arg(payload, "startDate"), _date_arg(payload, "endDate"))
+    deadline = _time.monotonic() + SOFT_DEADLINE_SECONDS
+    generations: Any = {}
+    if source == "wechat4":
+        documents = _require_wechat(context).iter_search_documents(
+            int(lower.timestamp()) if lower else None, int(upper.timestamp()) if upper else None,
+            deadline=deadline, generations=generations,
+        )
+    else:
+        generations = ("memory", context.source_session_id)
+        documents = _memory_search_documents(context, source, lower, upper, deadline)
+    context.emit_progress(0, 1, "正在搜索当前数据源的全部可读会话")
+    hits, total, coverage = scan_documents(documents, query, order, deadline=deadline)
+    if source == "wechat4":
+        reservation = getattr(hits, "reservation", None)
+        try:
+            _attach_live_search_projections(hits)
+        except Exception:
+            if reservation is not None:
+                reservation.release()
+                hits.reservation = None
+            raise
+    session = context.search_cache.create(
+        source, context.source_session_id, hits, total, coverage, generations,
+        criteria_fingerprint=content_fingerprint(query, payload.get("startDate"), payload.get("endDate"), order),
+    )
+    try:
+        result = search_page(session, 0, limit)
+    except Exception:
+        context.search_cache.discard(session.search_id)
+        raise
+    context.emit_progress(1, 1, "搜索已完成")
+    return result
+
+
+def handle_get_message_context(payload: dict[str, Any], context: Context) -> dict[str, Any]:
+    source = _require_search_source(payload, context)
+    if set(payload) - {"source", "sourceSessionId", "searchId", "hitId", "before", "after"}:
+        raise WorkerError("INVALID_ARGUMENT", "上下文请求不能携带新的搜索条件或物理位置。")
+    before = _int_arg(payload, "before", 20, 0, 20)
+    after = _int_arg(payload, "after", 20, 0, 20)
+    session = _search_session(payload, context, source)
+    hit_id = _search_token(payload, "hitId")
+    hit = next((candidate for candidate in session.hits if candidate.item["hitId"] == hit_id), None)
+    if hit is None:
+        raise WorkerError("CONTEXT_TARGET_UNKNOWN", "命中不属于当前搜索结果，请重新搜索。")
+    if source == "wechat4":
+        return _require_wechat(context).get_search_context(hit, session.generations, before, after)
+    locator = hit.locator
+    if not isinstance(locator, _MemoryLocator):
+        raise WorkerError("CONTEXT_TARGET_CHANGED", "搜索定位已失效，请重新搜索。")
+    conversation = next((item for item in _memory_search_conversations(context, source)
+                         if item.id == locator.conversation_id), None)
+    if conversation is None or not 0 <= locator.index < len(conversation.messages):
+        raise WorkerError("CONTEXT_TARGET_CHANGED", "原会话或消息已不可读取，请重新搜索。")
+    target = _memory_search_document(conversation, conversation.messages[locator.index], locator.index)
+    if target.fingerprint != hit.fingerprint or target.sort_key != hit.sort_key:
+        raise WorkerError("CONTEXT_TARGET_CHANGED", "原消息内容或身份已变化，请重新搜索。")
+    start = max(0, locator.index - before)
+    end = min(len(conversation.messages), locator.index + after + 1)
+    leading = [_memory_search_document(conversation, conversation.messages[index], index).message
+               for index in range(start, locator.index)]
+    trailing = [_memory_search_document(conversation, conversation.messages[index], index).message
+                for index in range(locator.index + 1, end)]
+    return bounded_context(target.conversation, leading, target.message, trailing,
+                           start > 0, end < len(conversation.messages))
 
 
 def _output_path(payload: dict[str, Any], suffix: str) -> Path:
@@ -656,12 +1344,11 @@ def _sanitize_for_text(messages: list[Message]) -> list[Message]:
                 type=MessageType.SYSTEM, content="[图片]", is_outgoing=message.is_outgoing,
             ))
         elif message.type is MessageType.FILE:
-            result.append(Message(
-                id=message.id, conversation_id=message.conversation_id,
-                sender=message.sender, timestamp=message.timestamp,
-                type=MessageType.SYSTEM, content=f"[文件] {message.content}",
-                is_outgoing=message.is_outgoing,
-            ))
+            # The C3 projection keeps FILE messages as canonical plain text so
+            # the structured exporter can distinguish app-message bodies from
+            # ordinary one-line attachment names.  The latter still render
+            # with the legacy [文件] label; multiline cards stay literal text.
+            result.append(message)
         elif message.type is MessageType.VOICE:
             transcript = message.transcript or ""
             content = f"语音转写：{transcript}" if transcript else "[语音消息]"
@@ -725,16 +1412,41 @@ def _write_models_atomic(conversation: Conversation, messages: list[Message],
                          output: Path, overwrite: bool) -> None:
     if output.exists() and not overwrite:
         raise WorkerError("OUTPUT_EXISTS", "输出文件已存在。请确认覆盖或选择其他位置。")
+    if output.is_dir() and overwrite:
+        # The legacy outer replace reported a write failure for a directory;
+        # keep that response contract while using the canonical writer below.
+        raise WorkerError("EXPORT_FAILED", "写入 Markdown 文件失败。")
+
+    if messages:
+        # Live Markdown is the C3 integration point.  Keep the legacy media
+        # projection, but let the canonical exporter render FILE content so
+        # app-message cards/forwards cannot reach the vendor basename branch.
+        try:
+            from wechat_memory.exporters import ExportError, export_conversation
+        except ImportError:
+            raise WorkerError("CAPABILITY_UNAVAILABLE", "当前软件包缺少导出组件。") from None
+        try:
+            export_conversation(
+                conversation,
+                _sanitize_for_text(messages),
+                output,
+                "markdown",
+                overwrite=overwrite,
+                materialize_media=False,
+            )
+        except ExportError as error:
+            raise WorkerError(error.code, error.message) from None
+        return
+
+    # Preserve the established empty-range Markdown contract, including its
+    # legacy notice and same-directory outer replace.
     try:
         descriptor, temp_name = tempfile.mkstemp(prefix=".wechat-memory-", suffix=".md.tmp", dir=str(output.parent))
         os.close(descriptor)
     except OSError:
         raise WorkerError("OUTPUT_NOT_WRITABLE", "输出位置不可写。") from None
     try:
-        if messages:
-            export_markdown(conversation, _sanitize_for_text(messages), temp_name)
-        else:
-            _empty_markdown(conversation, temp_name)
+        _empty_markdown(conversation, temp_name)
         os.replace(temp_name, output)
     except OSError:
         raise WorkerError("EXPORT_FAILED", "写入 Markdown 文件失败。") from None
@@ -1301,6 +2013,10 @@ def handle_transcribe_messages(payload: dict[str, Any], context: Context) -> dic
             getattr(error, "message", "语音转写失败。"),
             bool(getattr(error, "retryable", False)),
         ) from None
+    finally:
+        # Regeneration may have written a partial transcript cache even if it
+        # failed. Never keep a previous keyword match/display snapshot alive.
+        _clear_keyword_pages(context)
     transcribed = sum(1 for item in result if item.type is MessageType.VOICE and item.transcript)
     return {"total": len(result), "transcribed": transcribed}
 
@@ -1313,6 +2029,9 @@ HANDLERS = {
     "import_json": handle_import_json,
     "list_conversations": handle_list_conversations,
     "get_messages": handle_get_messages,
+    "get_messages_page": handle_get_messages_page,
+    "search_messages": handle_search_messages,
+    "get_message_context": handle_get_message_context,
     "export_markdown": handle_export_markdown,
     "export_json": handle_export_json,
     "export_pdf": handle_export_pdf,
@@ -1408,6 +2127,8 @@ def serve(stream_in: BinaryIO, stream_out: BinaryIO, demo_path: str,
                 command = payload.get("command")
                 if not isinstance(command, str) or command not in HANDLERS:
                     raise WorkerError("UNKNOWN_COMMAND", "不支持的命令。")
+                if command in {"search_messages", "get_message_context", "get_messages_page"} and len(request_id.encode("utf-8")) > 256:
+                    raise WorkerError("INVALID_ARGUMENT", "请求标识超过长度上限。")
                 body = payload.get("payload", {})
                 if not isinstance(body, dict):
                     raise WorkerError("INVALID_ARGUMENT", "payload 必须是 JSON 对象。")
@@ -1436,6 +2157,14 @@ def serve(stream_in: BinaryIO, stream_out: BinaryIO, demo_path: str,
                     traceback.print_exc(file=sys.stderr)
                     _write(stream_out, _failure(request_id, "INTERNAL_ERROR", "工作进程内部错误。"))
     finally:
+        context.search_cache.clear()
+        _clear_keyword_pages(context)
+        context.demo_search_snapshot = None
+        if context.demo_page_provider is not None:
+            context.demo_page_provider.close()
+            context.demo_page_provider = None
+        if context.offline_page_provider is not None:
+            context.offline_page_provider.close()
         if context.wechat is not None:
             try:
                 context.wechat.close()

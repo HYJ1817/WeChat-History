@@ -6,17 +6,31 @@
  </PropertyGroup>
  <ItemGroup>
   <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.12.0" />
+  <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
   <PackageReference Include="xunit" Version="2.9.3" />
   <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1"><PrivateAssets>all</PrivateAssets></PackageReference>
  </ItemGroup>
  <ItemGroup>
   <Compile Include="../../src/NativeApp/Models/ChatModels.cs" Link="Models/ChatModels.cs" />
+  <Compile Include="../../src/NativeApp/Models/MessageProjection.cs" Link="Models/MessageProjection.cs" />
+  <Compile Include="../../src/NativeApp/Services/MessageProjectionReader.cs" Link="Services/MessageProjectionReader.cs" />
+  <Compile Include="../../src/NativeApp/ViewModels/MessageCardViewModel.cs" Link="ViewModels/MessageCardViewModel.cs" />
   <Compile Include="../../src/NativeApp/Services/Protocol.cs" Link="Services/Protocol.cs" />
   <Compile Include="../../src/NativeApp/Services/DateRange.cs" Link="Services/DateRange.cs" />
   <Compile Include="../../src/NativeApp/Services/WorkerClient.cs" Link="Services/WorkerClient.cs" />
   <Compile Include="../../src/NativeApp/Services/OperationGate.cs" Link="Services/OperationGate.cs" />
   <Compile Include="../../src/NativeApp/Services/TaskHistoryWorkflow.cs" Link="Services/TaskHistoryWorkflow.cs" />
+  <Compile Include="../../src/NativeApp/Services/GlobalSearchWorkflow.cs" Link="Services/GlobalSearchWorkflow.cs" />
+  <Compile Include="../../src/NativeApp/Services/MessagePagingWorkflow.cs" Link="Services/MessagePagingWorkflow.cs" />
+  <Compile Include="../../src/NativeApp/ViewModels/MainViewModel.MessagePaging.cs" Link="ViewModels/MainViewModel.MessagePaging.cs" />
+  <Compile Include="../../src/NativeApp/Services/SearchEnterGuard.cs" Link="Services/SearchEnterGuard.cs" />
+  <Compile Include="../../src/NativeApp/Services/AppLog.cs" Link="Services/AppLog.cs" />
+  <Compile Include="../../src/NativeApp/ViewModels/MainViewModel.cs" Link="ViewModels/MainViewModel.cs" />
   <None Include="fixtures/fake_worker.py" CopyToOutputDirectory="PreserveNewest" />
+  <None Include="fixtures/global_search_vm_worker.py" CopyToOutputDirectory="PreserveNewest" />
+  <None Include="fixtures/message_paging_vm_worker.py" CopyToOutputDirectory="PreserveNewest" />
+  <None Include="fixtures/message_paging_real_worker.py" CopyToOutputDirectory="PreserveNewest" />
+  <None Include="fixtures/message_cards_vm_worker.py" CopyToOutputDirectory="PreserveNewest" />
   <None Include="fixtures/partial_prune_result.json" CopyToOutputDirectory="PreserveNewest" />
  </ItemGroup>
 </Project>
