@@ -1,0 +1,1083 @@
+"""Synthetic-only task maintenance tests; never use a user's job root.
+
+Run from the project root:
+  .venv\\Scripts\\python.exe -I -X utf8 tests/PythonWorker.Tests/test_task_maintenance.py -v
+"""
+from __future__ import annotations
+
+import copy
+import ctypes
+import json
+import mmap
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+WORKER_DIR = ROOT / "src" / "PythonWorker"
+for _path in (WORKER_DIR, WORKER_DIR / "vendor"):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+from wechat_context_exporter.jobs import (  # noqa: E402
+    JobManifest,
+    JobStatus,
+    collect_artifacts,
+    format_utc,
+)
+from wechat_context_exporter.jobs.models import JobState  # noqa: E402
+from wechat_memory import safe_delete, tasks  # noqa: E402
+from wechat_memory.tasks import TaskError, TaskService  # noqa: E402
+
+NOW = datetime(2026, 11, 28, 12, tzinfo=timezone.utc)
+OLD = NOW - timedelta(days=90)
+
+
+class TaskMaintenanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="wechat-task-maintenance-synthetic-")
+        self.addCleanup(self.temp.cleanup)
+        self.temp_dir = Path(self.temp.name).resolve()
+        self.jobs_root = self.temp_dir / "managed-jobs"
+        self.service = TaskService(self.jobs_root, self.temp_dir / "scenes.json")
+        self.clock = patch.object(tasks, "utc_now", return_value=NOW)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.sequence = 0
+
+    def make_job(
+        self,
+        status: JobStatus = JobStatus.DELIVERED,
+        *,
+        bucket: str = "Ready",
+        root: Path | None = None,
+        job_id: str | None = None,
+    ) -> Path:
+        self.sequence += 1
+        job_id = job_id or f"synthetic-{self.sequence:03d}"
+        root = root or self.jobs_root
+        self.assertTrue(root.is_relative_to(self.temp_dir))
+        directory = root / bucket / job_id
+        files = directory / "files"
+        assets = files / "chat_assets" / "nested"
+        assets.mkdir(parents=True)
+        (files / "chat.md").write_bytes(b"# Synthetic archive\n")
+        (assets / "image.bin").write_bytes(b"synthetic-image")
+        (directory / "prompt.txt").write_text("synthetic prompt", encoding="utf-8")
+        manifest = JobManifest(
+            job_id=job_id,
+            conversation_id="fictional-conversation",
+            conversation_name="Synthetic only",
+            created_at=OLD,
+            source_kind="demo",
+            message_count=1,
+            artifacts=tuple(collect_artifacts(files)),
+        )
+        state = JobState(job_id=job_id, status=status, updated_at=OLD, attempts=2)
+        (directory / "manifest.json").write_text(manifest.to_json(), encoding="utf-8")
+        (directory / "state.json").write_text(state.to_json(), encoding="utf-8")
+        self.age_job(directory)
+        return directory
+
+    def age_job(self, directory: Path, when: datetime = OLD) -> None:
+        # Called only on our own generated tree, never across a link/reparse point.
+        self.assertTrue(directory.is_relative_to(self.temp_dir))
+        stamp = int(when.timestamp()) * 1_000_000_000
+        for base, directories, files in os.walk(directory, followlinks=False):
+            for name in directories + files:
+                path = Path(base) / name
+                info = path.lstat()
+                self.assertFalse(stat.S_ISLNK(info.st_mode))
+                self.assertFalse(getattr(info, "st_file_attributes", 0) & 0x400)
+                os.utime(path, ns=(stamp, stamp))
+        os.utime(directory, ns=(stamp, stamp))
+
+    def edit_json(self, directory: Path, name: str, **changes) -> None:
+        path = directory / name
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(changes)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    @staticmethod
+    def tree_snapshot(directory: Path) -> dict:
+        if not directory.exists():
+            return {}
+        result = {}
+        for path in (directory, *sorted(directory.rglob("*"))):
+            info = path.lstat()
+            result[str(path.relative_to(directory))] = (
+                info.st_mtime_ns, info.st_size,
+                path.read_bytes() if path.is_file() else None,
+            )
+        return result
+
+    def directory_link(self, link: Path, target: Path) -> None:
+        self.assertTrue(link.is_relative_to(self.temp_dir))
+        self.assertTrue(target.is_relative_to(self.temp_dir))
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError:
+            if os.name != "nt":
+                raise
+            # A junction needs no Windows symlink privilege. Both endpoints are
+            # generated by this test and removed explicitly before temp cleanup.
+            result = subprocess.run(
+                ["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True, check=False,
+            )
+            if result.returncode:
+                self.skipTest("Neither directory symlink nor temp junction is available")
+        self.addCleanup(self.remove_directory_link, link)
+
+    @staticmethod
+    def remove_directory_link(path: Path) -> None:
+        if path.is_symlink() or path.exists():
+            if os.name == "nt":
+                os.rmdir(path)
+            else:
+                path.unlink()
+
+    def assert_protected(self, directory: Path, reason: str | None = None) -> dict:
+        preview = self.service.preview_prune_jobs(30)
+        self.assertNotIn(directory.name, [item["jobId"] for item in preview["candidates"]])
+        skipped = next(item for item in preview["skipped"] if item["jobId"] == directory.name)
+        if reason is not None:
+            self.assertEqual(skipped["reason"], reason)
+        self.assertIsNone(skipped["artifactBytes"])
+        self.assertGreaterEqual(preview["unknownSizeCount"], 1)
+        self.assertTrue(directory.exists())
+        return preview
+
+    def test_missing_root_preview_does_not_create_anything(self) -> None:
+        before = self.tree_snapshot(self.temp_dir)
+        preview = self.service.preview_prune_jobs(30)
+        self.assertEqual(preview["candidateCount"], 0)
+        self.assertEqual(preview["knownArtifactBytes"], 0)
+        self.assertEqual(preview["unknownSizeCount"], 0)
+        self.assertEqual(preview["snapshot"]["jobs"], [])
+        self.assertEqual(self.tree_snapshot(self.temp_dir), before)
+        self.assertFalse(self.jobs_root.exists())
+        self.assertFalse(self.service.scenes_file.exists())
+
+    def test_preview_and_dry_run_are_read_only_and_count_actual_attachments(self) -> None:
+        directory = self.make_job()
+        before = self.tree_snapshot(self.temp_dir)
+        with patch.object(tasks, "ProtectedTree", side_effect=AssertionError("dry run acquired delete handles")):
+            preview = self.service.preview_prune_jobs(30)
+            alias = self.service.prune_jobs(30, dry_run=True)
+        self.assertEqual(alias, preview)
+        self.assertTrue(preview["dryRun"])
+        self.assertEqual(preview["days"], 30)
+        self.assertEqual(preview["cutoff"], format_utc(NOW - timedelta(days=30)))
+        self.assertEqual(preview["candidateCount"], 1)
+        expected_size = len(b"# Synthetic archive\n") + len(b"synthetic-image")
+        self.assertEqual(preview["knownArtifactBytes"], expected_size)
+        self.assertEqual(preview["candidates"][0]["artifactBytes"], expected_size)
+        self.assertEqual(preview["unknownSizeCount"], 0)
+        self.assertEqual(self.tree_snapshot(self.temp_dir), before)
+        encoded = json.dumps(preview)
+        self.assertNotIn(str(directory), encoded)
+        self.assertNotIn("Synthetic only", encoded)
+        self.assertNotIn("synthetic prompt", encoded)
+        self.assertNotIn("# Synthetic archive", encoded)
+
+    def test_explicit_snapshot_removes_only_selected_unchanged_ids(self) -> None:
+        first = self.make_job()
+        unselected = self.make_job(JobStatus.COPIED)
+        snapshot = json.loads(json.dumps(self.service.preview_prune_jobs(30)["snapshot"]))
+        snapshot["jobs"] = [item for item in snapshot["jobs"] if item["jobId"] == first.name]
+        # Even an old-looking job created after the preview is outside consent.
+        later = self.make_job(JobStatus.EXPIRED)
+        result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [first.name])
+        self.assertEqual(result["skipped"], [])
+        self.assertFalse(first.exists())
+        self.assertTrue(unselected.exists())
+        self.assertTrue(later.exists())
+        replay = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(replay["removed"], [])
+        self.assertEqual(replay["skipped"], [{"jobId": first.name, "reason": "not_found"}])
+
+    def test_empty_snapshot_never_falls_back_to_all_jobs(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        snapshot["jobs"] = []
+        result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertTrue(directory.is_dir())
+
+    def test_legacy_manual_call_and_actual_completed_statuses(self) -> None:
+        directories = [self.make_job(status) for status in (
+            JobStatus.DELIVERED, JobStatus.COPIED, JobStatus.EXPIRED,
+        )]
+        # Finished retry deliveries can remain under Failed; the metadata status,
+        # not the bucket name, is what defines completed work.
+        directories.append(self.make_job(JobStatus.DELIVERED, bucket="Failed"))
+        self.assertTrue(all(path.exists() for path in directories))
+        result = self.service.prune_jobs(30)
+        self.assertEqual(set(result["removed"]), {path.name for path in directories})
+        self.assertTrue(all(not path.exists() for path in directories))
+
+    def test_legacy_manual_call_can_cross_a_clock_second_during_preview(self) -> None:
+        directory = self.make_job()
+        with patch.object(tasks, "utc_now", side_effect=[NOW, NOW + timedelta(seconds=1)]):
+            result = self.service.prune_jobs(30)
+        self.assertEqual(result["removed"], [directory.name])
+
+    def test_every_unfinished_or_retryable_status_is_preserved(self) -> None:
+        directories = [self.make_job(status) for status in (
+            JobStatus.PENDING, JobStatus.RUNNING, JobStatus.READY, JobStatus.FAILED,
+        )]
+        failed = self.make_job(JobStatus.FAILED, bucket="Failed")
+        self.edit_json(failed, "state.json", attempts=20, target="folder", error="retry available")
+        self.age_job(failed)
+        directories.append(failed)
+        staging = self.make_job(JobStatus.RUNNING, bucket=".staging")
+        directories.append(staging)
+        # Staging is protected even if a crash left an apparently finished state.
+        directories.append(self.make_job(JobStatus.DELIVERED, bucket=".staging"))
+        preview = self.service.preview_prune_jobs(30)
+        self.assertEqual(preview["candidateCount"], 0)
+        self.assertTrue(all(item["reason"] == "unfinished" for item in preview["skipped"]))
+        self.assertEqual(self.service.prune_jobs(30)["removed"], [])
+        self.assertTrue(all(path.exists() for path in directories))
+
+    def test_changed_state_after_preview_is_revalidated(self) -> None:
+        for status in (JobStatus.FAILED, JobStatus.READY, JobStatus.RUNNING, JobStatus.PENDING):
+            with self.subTest(status=status):
+                directory = self.make_job()
+                snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+                # Restrict each subtest to its own job.
+                snapshot["jobs"] = [item for item in snapshot["jobs"] if item["jobId"] == directory.name]
+                self.edit_json(directory, "state.json", status=status.value)
+                self.age_job(directory)
+                result = self.service.prune_jobs(30, snapshot=snapshot)
+                self.assertEqual(result["removed"], [])
+                self.assertEqual(result["skipped"][0]["reason"], "unfinished")
+                self.assertTrue(directory.exists())
+
+    def test_schema_or_corruption_introduced_after_preview_is_preserved(self) -> None:
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt):
+                directory = self.make_job()
+                snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+                snapshot["jobs"] = [item for item in snapshot["jobs"] if item["jobId"] == directory.name]
+                if corrupt:
+                    (directory / "state.json").write_bytes(b"{broken JSON")
+                else:
+                    self.edit_json(directory, "manifest.json", schema_version=2)
+                self.age_job(directory)
+                result = self.service.prune_jobs(30, snapshot=snapshot)
+                self.assertEqual(result["removed"], [])
+                self.assertTrue(directory.exists())
+
+    def test_recreated_job_with_same_id_is_not_the_previewed_directory(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        saved = self.temp_dir / "saved-original-job"
+        directory.rename(saved)
+        replacement = self.make_job(job_id=directory.name)
+        result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"][0]["reason"], "changed")
+        self.assertTrue(saved.exists())
+        self.assertTrue(replacement.exists())
+
+    def test_changed_but_still_completed_metadata_does_not_match_snapshot(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        self.edit_json(directory, "state.json", status="copied", detail="changed after preview")
+        self.age_job(directory)
+        result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"], [{"jobId": directory.name, "reason": "changed"}])
+        self.assertTrue(directory.exists())
+
+    def test_snapshot_cutoff_does_not_advance_when_confirmation_is_delayed(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        with patch.object(tasks, "utc_now", return_value=NOW + timedelta(days=10)):
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["cutoff"], snapshot["cutoff"])
+        self.assertEqual(result["removed"], [directory.name])
+
+    def test_written_after_preview_is_preserved(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        (directory / "files" / "chat.md").write_bytes(b"new bytes written after preview")
+        result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"][0]["reason"], "recent_write")
+        self.assertTrue(directory.exists())
+
+    def test_backdated_tree_change_still_invalidates_fingerprint(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        (directory / "files" / "extra.bin").write_bytes(b"additional synthetic artifact")
+        self.age_job(directory)
+        result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"][0]["reason"], "changed")
+
+    def test_same_size_artifact_rewrite_with_restored_mtime_invalidates_snapshot(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        artifact = directory / "files" / "chat.md"
+        before = artifact.stat()
+        artifact.write_bytes(b"x" * before.st_size)
+        # Windows st_ctime is creation time on Python 3.11. A timestamp-
+        # preserving writer must not make changed content look unchanged.
+        os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+        result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"][0]["reason"], "changed")
+        self.assertTrue(directory.exists())
+
+    def test_recent_nested_empty_directory_is_preserved(self) -> None:
+        directory = self.make_job()
+        nested = directory / "files" / "chat_assets" / "nested"
+        os.utime(nested, (NOW.timestamp(), NOW.timestamp()))
+        self.assert_protected(directory, "recent_write")
+        self.assertEqual(self.service.prune_jobs(30)["removed"], [])
+
+    def test_recent_deep_file_is_preserved_even_when_ancestors_are_old(self) -> None:
+        directory = self.make_job()
+        leaf = directory / "files" / "chat_assets" / "nested" / "image.bin"
+        os.utime(leaf, (NOW.timestamp(), NOW.timestamp()))
+        self.assert_protected(directory, "recent_write")
+
+    def test_recent_prompt_or_metadata_write_is_preserved(self) -> None:
+        for name in ("prompt.txt", "manifest.json", "state.json"):
+            with self.subTest(name=name):
+                directory = self.make_job()
+                os.utime(directory / name, (NOW.timestamp(), NOW.timestamp()))
+                self.assert_protected(directory, "recent_write")
+
+    def test_recent_creation_or_completion_is_preserved(self) -> None:
+        for name, key in (("manifest.json", "created_at"), ("state.json", "updated_at")):
+            with self.subTest(name=name):
+                directory = self.make_job()
+                self.edit_json(directory, name, **{key: format_utc(NOW)})
+                self.age_job(directory)
+                self.assert_protected(directory, "not_old")
+
+    def test_cutoff_boundary_uses_same_rule_for_preview_and_execution(self) -> None:
+        directory = self.make_job()
+        cutoff = NOW - timedelta(days=30)
+        self.edit_json(directory, "manifest.json", created_at=format_utc(cutoff))
+        self.edit_json(directory, "state.json", updated_at=format_utc(cutoff))
+        self.age_job(directory, cutoff)
+        preview = self.service.preview_prune_jobs(30)
+        self.assertEqual(preview["candidateCount"], 1)
+        self.assertEqual(self.service.prune_jobs(30, snapshot=preview["snapshot"])["removed"], [directory.name])
+
+    def test_future_unknown_or_missing_manifest_schema_is_preserved(self) -> None:
+        for version in (2, 999, 0, -1, "1", True, None):
+            with self.subTest(version=version):
+                directory = self.make_job()
+                self.edit_json(directory, "manifest.json", schema_version=version)
+                self.age_job(directory)
+                self.assert_protected(directory, "unsupported_schema")
+        directory = self.make_job()
+        path = directory / "manifest.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        del payload["schema_version"]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        self.age_job(directory)
+        self.assert_protected(directory, "unsupported_schema")
+        self.assertEqual(self.service.prune_jobs(30)["removed"], [])
+
+    def test_future_state_schema_and_unknown_status_are_preserved(self) -> None:
+        directory = self.make_job()
+        self.edit_json(directory, "state.json", schema_version=2)
+        self.age_job(directory)
+        self.assert_protected(directory, "unsupported_schema")
+        unknown = self.make_job()
+        self.edit_json(unknown, "state.json", status="retrying")
+        self.age_job(unknown)
+        self.assert_protected(unknown, "unreadable_metadata")
+
+    def test_corrupt_json_utf8_duplicate_keys_and_missing_metadata_are_preserved(self) -> None:
+        for name, raw in (
+            ("manifest.json", b"{"), ("state.json", b"{"),
+            ("manifest.json", b"\xff"), ("state.json", b"[]"),
+            ("manifest.json", b'{"schema_version":1,"schema_version":2}'),
+            ("state.json", b'{"status":"failed","status":"delivered"}'),
+        ):
+            with self.subTest(name=name, raw=raw):
+                directory = self.make_job()
+                (directory / name).write_bytes(raw)
+                self.age_job(directory)
+                self.assert_protected(directory, "unreadable_metadata")
+        for name in ("manifest.json", "state.json"):
+            directory = self.make_job()
+            (directory / name).unlink()
+            self.age_job(directory)
+            self.assert_protected(directory)
+        self.assertEqual(self.service.prune_jobs(30)["removed"], [])
+
+    def test_nonfinite_json_constants_and_oversized_metadata_are_preserved(self) -> None:
+        directory = self.make_job()
+        self.edit_json(directory, "manifest.json", notes=[float("nan")])
+        self.age_job(directory)
+        self.assert_protected(directory, "unreadable_metadata")
+        oversized = self.make_job()
+        (oversized / "state.json").write_bytes(b" " * (tasks._MAX_PRUNE_METADATA_BYTES + 1))
+        self.age_job(oversized)
+        self.assert_protected(oversized, "unreadable_metadata")
+        self.assertEqual(self.service.prune_jobs(30)["removed"], [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows case-insensitive path semantics")
+    def test_windows_case_insensitive_files_directory_is_counted(self) -> None:
+        directory = self.make_job()
+        (directory / "files").rename(directory / "FILES")
+        self.age_job(directory)
+        preview = self.service.preview_prune_jobs(30)
+        self.assertEqual(preview["candidateCount"], 1)
+        self.assertEqual(preview["knownArtifactBytes"], len(b"# Synthetic archive\n") + len(b"synthetic-image"))
+
+    def test_mismatched_job_identity_and_missing_timestamp_are_preserved(self) -> None:
+        for name, changes in (
+            ("manifest.json", {"job_id": "another-job"}),
+            ("state.json", {"job_id": "another-job"}),
+            ("state.json", {"updated_at": None}),
+            ("state.json", {"attempts": "2"}),
+        ):
+            directory = self.make_job()
+            self.edit_json(directory, name, **changes)
+            self.age_job(directory)
+            self.assert_protected(directory, "unreadable_metadata")
+
+    def test_duplicate_id_across_buckets_or_staging_is_preserved(self) -> None:
+        first = self.make_job()
+        duplicate = self.make_job(JobStatus.FAILED, bucket="Failed", job_id=first.name)
+        self.assert_protected(first, "duplicate_id")
+        self.assertTrue(duplicate.exists())
+        self.assertEqual(self.service.prune_jobs(30)["removed"], [])
+        another = self.make_job()
+        self.make_job(JobStatus.RUNNING, bucket=".staging", job_id=another.name)
+        self.assert_protected(another, "duplicate_id")
+
+    def test_unreadable_metadata_is_unknown_not_zero(self) -> None:
+        directory = self.make_job()
+        original = Path.open
+
+        def denied(path, *args, **kwargs):
+            if path == directory / "state.json":
+                raise PermissionError("private synthetic path must not leak")
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "open", denied):
+            preview = self.assert_protected(directory, "unreadable_metadata")
+            self.assertEqual(preview["candidateCount"], 0)
+            self.assertIsNone(preview["skipped"][0]["artifactBytes"])
+            self.assertNotIn("private synthetic path", json.dumps(preview))
+
+    def test_unreadable_artifact_contents_are_conservatively_preserved(self) -> None:
+        directory = self.make_job()
+        original = Path.open
+
+        def denied(path, *args, **kwargs):
+            if path == directory / "files" / "chat.md":
+                raise PermissionError("private artifact path")
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "open", denied):
+            preview = self.assert_protected(directory, "unreadable")
+            self.assertIsNone(preview["skipped"][0]["artifactBytes"])
+            self.assertEqual(self.service.prune_jobs(30)["removed"], [])
+
+    def test_unreadable_attachment_directory_is_unknown_and_not_deleted(self) -> None:
+        directory = self.make_job()
+        blocked = directory / "files" / "chat_assets"
+        original = os.scandir
+
+        def denied(path):
+            if Path(path) == blocked:
+                raise PermissionError("private synthetic path")
+            return original(path)
+
+        with patch.object(tasks.os, "scandir", denied):
+            preview = self.assert_protected(directory, "unreadable")
+            self.assertEqual(preview["knownArtifactBytes"], 0)
+            self.assertEqual(self.service.prune_jobs(30)["removed"], [])
+
+    def test_directory_link_to_external_job_is_not_followed(self) -> None:
+        external = self.make_job(root=self.temp_dir / "outside-managed-root")
+        before = self.tree_snapshot(external)
+        ready = self.jobs_root / "Ready"
+        ready.mkdir(parents=True)
+        link = ready / external.name
+        self.directory_link(link, external)
+        self.assert_protected(link, "unsafe_path")
+        self.assertEqual(self.service.prune_jobs(30)["removed"], [])
+        self.assertEqual(self.tree_snapshot(external), before)
+
+    def test_nested_link_is_not_followed_for_size_or_deletion(self) -> None:
+        directory = self.make_job()
+        external = self.temp_dir / "external-originals"
+        external.mkdir()
+        original = external / "user-original.json"
+        original.write_bytes(b'{"synthetic_user_original":true}')
+        link = directory / "files" / "external-link"
+        self.directory_link(link, external)
+        os.utime(directory / "files", (OLD.timestamp(), OLD.timestamp()))
+        before = self.tree_snapshot(external)
+        preview = self.assert_protected(directory, "unsafe_path")
+        self.assertEqual(preview["knownArtifactBytes"], 0)
+        self.assertEqual(self.service.prune_jobs(30)["removed"], [])
+        self.assertEqual(self.tree_snapshot(external), before)
+
+    def test_hardlinked_metadata_and_artifacts_are_conservatively_protected(self) -> None:
+        for name in ("manifest.json", "files/chat.md"):
+            directory = self.make_job()
+            source = directory / name
+            external = self.temp_dir / f"external-hardlink-{self.sequence}.bin"
+            os.link(source, external)
+            self.age_job(directory)
+            before = external.read_bytes()
+            self.assert_protected(directory, "unsafe_path")
+            self.assertEqual(self.service.prune_jobs(30)["removed"], [])
+            self.assertEqual(external.read_bytes(), before)
+
+    def test_linked_bucket_or_replaced_root_is_rejected(self) -> None:
+        external = self.temp_dir / "external-bucket"
+        external.mkdir()
+        self.jobs_root.mkdir()
+        self.directory_link(self.jobs_root / "Ready", external)
+        with self.assertRaises(TaskError) as raised:
+            self.service.preview_prune_jobs(30)
+        self.assertEqual(raised.exception.code, "JOB_PATH_UNSAFE")
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_root_replaced_after_preview_cannot_redirect_deletion(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        backup = self.temp_dir / "saved-managed-root"
+        self.jobs_root.rename(backup)
+        external = self.temp_dir / "unrelated-root"
+        external.mkdir()
+        self.directory_link(self.jobs_root, external)
+        with self.assertRaises(TaskError) as raised:
+            self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(raised.exception.code, "JOB_PATH_UNSAFE")
+        self.assertTrue((backup / "Ready" / directory.name).is_dir())
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_real_folder_and_obsidian_deliveries_and_original_json_are_untouched(self) -> None:
+        folder = self.temp_dir / "folder-delivery"
+        vault = self.temp_dir / "obsidian-vault"
+        folder.mkdir()
+        vault.mkdir()
+        original = self.temp_dir / "user-import-original.json"
+        original.write_bytes(b'{"messages":["synthetic original"]}')
+        directories = []
+        for target in (
+            {"kind": "folder", "root": str(folder), "organizeByDate": False},
+            {"kind": "obsidian", "vault": str(vault)},
+        ):
+            directory = self.make_job(JobStatus.READY)
+            result = self.service.deliver_job(directory.name, target)
+            self.assertEqual(result["status"], "delivered")
+            self.age_job(directory)
+            self.edit_json(directory, "state.json", updated_at=format_utc(OLD))
+            self.age_job(directory)
+            directories.append(directory)
+        delivered = (self.tree_snapshot(folder), self.tree_snapshot(vault), original.read_bytes())
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(set(result["removed"]), {path.name for path in directories})
+        self.assertEqual((self.tree_snapshot(folder), self.tree_snapshot(vault), original.read_bytes()), delivered)
+
+    def test_unmanaged_folders_and_logs_are_not_pruned(self) -> None:
+        directory = self.make_job()
+        other = self.jobs_root / "Other" / "synthetic-unmanaged"
+        other.mkdir(parents=True)
+        (other / "keep.json").write_bytes(b"synthetic keep")
+        logs = self.jobs_root / "Logs"
+        logs.mkdir()
+        (logs / "old.log").write_bytes(b"synthetic keep log")
+        before = (self.tree_snapshot(other), self.tree_snapshot(logs))
+        self.assertEqual(self.service.prune_jobs(30)["removed"], [directory.name])
+        self.assertEqual((self.tree_snapshot(other), self.tree_snapshot(logs)), before)
+
+    def test_invalid_retention_days_never_modify_disk(self) -> None:
+        self.make_job()
+        before = self.tree_snapshot(self.temp_dir)
+        for days in (0, -1, True, False, 1.5, "30", None, 10**100):
+            for operation in (self.service.preview_prune_jobs, self.service.prune_jobs):
+                with self.subTest(days=days, operation=operation.__name__):
+                    with self.assertRaises(TaskError) as raised:
+                        operation(days)
+                    self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+        self.assertEqual(self.tree_snapshot(self.temp_dir), before)
+
+    def test_invalid_snapshots_and_options_are_rejected_before_deletion(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        invalid = [[], {}, {**snapshot, "version": True}, {**snapshot, "days": 1},
+                   {**snapshot, "cutoff": format_utc(NOW)}, {**snapshot, "jobs": "all"}]
+        traversal = copy.deepcopy(snapshot)
+        traversal["jobs"][0]["jobId"] = "../outside"
+        invalid.append(traversal)
+        duplicate = copy.deepcopy(snapshot)
+        duplicate["jobs"].append(duplicate["jobs"][0])
+        invalid.append(duplicate)
+        unknown_hash = copy.deepcopy(snapshot)
+        unknown_hash["jobs"][0]["fingerprint"] = "not-a-fingerprint"
+        invalid.append(unknown_hash)
+        for value in invalid:
+            with self.subTest(snapshot=value):
+                with self.assertRaises(TaskError) as raised:
+                    self.service.prune_jobs(30, snapshot=value)
+                self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+        for kwargs in ({"dry_run": 1}, {"dry_run": True, "snapshot": snapshot}):
+            with self.assertRaises(TaskError):
+                self.service.prune_jobs(30, **kwargs)
+        self.assertTrue(directory.exists())
+
+    def test_strict_metadata_types_are_not_coerced_into_deletion_authority(self) -> None:
+        malformed = (
+            ("manifest.json", "message_count", 1.75),
+            ("manifest.json", "message_count", True),
+            ("manifest.json", "message_count", "1"),
+            ("manifest.json", "message_count", None),
+            ("manifest.json", "message_count", -1),
+            ("manifest.json", "artifacts", {}),
+            ("manifest.json", "artifacts", None),
+            ("manifest.json", "artifacts", [None]),
+            ("manifest.json", "artifacts", [{"name": "chat.md", "size": True, "sha256": "a" * 64}]),
+            ("manifest.json", "artifacts", [{"name": [], "size": 1, "sha256": "a" * 64}]),
+            ("manifest.json", "conversation", {"id": None, "name": []}),
+            ("manifest.json", "conversation", {"id": 123, "name": "Synthetic"}),
+            ("manifest.json", "conversation", {"id": "synthetic", "name": []}),
+            ("manifest.json", "source", {"kind": [], "label": "synthetic"}),
+            ("manifest.json", "source", {"kind": "demo", "label": False}),
+            ("manifest.json", "source", {"kind": "demo", "wechat_version": 4}),
+            ("manifest.json", "window", []),
+            ("manifest.json", "window", {"query": False}),
+            ("manifest.json", "scene", {"id": []}),
+            ("manifest.json", "reference", {"first": {}}),
+            ("manifest.json", "reference", {"last": {"id": 1, "timestamp": format_utc(OLD)}}),
+            ("manifest.json", "notes", "synthetic"),
+            ("manifest.json", "notes", [1]),
+            ("state.json", "status", []),
+            ("state.json", "attempts", True),
+            ("state.json", "attempts", 1.75),
+            ("state.json", "attempts", -1),
+            ("state.json", "target", {}),
+            ("state.json", "destination", []),
+            ("state.json", "detail", 4),
+            ("state.json", "error", False),
+        )
+        for name, key, value in malformed:
+            with self.subTest(name=name, key=key, value=value):
+                directory = self.make_job()
+                # Exercise both preview and execution on formerly valid consent.
+                snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+                snapshot["jobs"] = [item for item in snapshot["jobs"] if item["jobId"] == directory.name]
+                self.edit_json(directory, name, **{key: value})
+                self.age_job(directory)
+                self.assert_protected(directory, "unreadable_metadata")
+                result = self.service.prune_jobs(30, snapshot=snapshot)
+                self.assertEqual(result["removed"], [])
+                self.assertEqual(result["skipped"], [{"jobId": directory.name, "reason": "unreadable_metadata"}])
+
+    def test_year_one_snapshot_cutoff_does_not_overflow_windows_timestamp(self) -> None:
+        directory = self.make_job()
+        cutoff = datetime(1, 1, 1, tzinfo=timezone.utc)
+        with self.assertRaises(tasks._PruneProtected) as raised:
+            tasks._prune_tree(directory, cutoff)
+        self.assertEqual(raised.exception.reason, "recent_write")
+
+    def test_missing_required_v1_fields_are_not_defaulted_for_deletion(self) -> None:
+        for name, field in (
+            ("manifest.json", "message_count"), ("manifest.json", "artifacts"),
+            ("manifest.json", "source"), ("manifest.json", "conversation"),
+            ("manifest.json", "created_at"), ("state.json", "updated_at"),
+            ("state.json", "status"), ("state.json", "attempts"),
+        ):
+            with self.subTest(name=name, field=field):
+                directory = self.make_job()
+                path = directory / name
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                del payload[field]
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                self.age_job(directory)
+                self.assert_protected(directory, "unreadable_metadata")
+
+    def test_valid_optional_v1_fields_may_be_omitted_or_populated(self) -> None:
+        minimal = self.make_job()
+        path = minimal / "manifest.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for field in ("window", "scene", "reference", "notes"):
+            del payload[field]
+        payload["source"] = {"kind": "demo"}
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        path = minimal / "state.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for field in ("target", "destination", "detail", "error"):
+            del payload[field]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        self.age_job(minimal)
+        populated = self.make_job()
+        self.edit_json(populated, "manifest.json",
+                       window={"start": format_utc(OLD), "end": None, "query": "synthetic"},
+                       scene={"id": "synthetic-scene", "name": "Synthetic"},
+                       reference={"first": {"id": "m1", "timestamp": format_utc(OLD),
+                                            "sender": "Synthetic", "preview": "synthetic"}},
+                       notes=["synthetic note"])
+        self.age_job(populated)
+        result = self.service.prune_jobs(30)
+        self.assertEqual(set(result["removed"]), {minimal.name, populated.name})
+
+    def test_overflow_metadata_does_not_hide_earlier_success_or_abort_later_jobs(self) -> None:
+        first = self.make_job()
+        infinite = self.make_job()
+        offset = self.make_job()
+        last = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        # A legal JSON exponent, not the NaN/Infinity parse_constant path.
+        path = infinite / "manifest.json"
+        data = path.read_text(encoding="utf-8").replace('"message_count": 1', '"message_count": 1e9999')
+        path.write_text(data, encoding="utf-8")
+        self.edit_json(offset, "state.json", updated_at="0001-01-01T00:00:00+01:00")
+        self.age_job(infinite)
+        self.age_job(offset)
+        preview = self.service.preview_prune_jobs(30)
+        self.assertEqual({item["jobId"] for item in preview["skipped"]}, {infinite.name, offset.name})
+        result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [first.name, last.name])
+        self.assertEqual(result["skipped"], [
+            {"jobId": infinite.name, "reason": "unreadable_metadata"},
+            {"jobId": offset.name, "reason": "unreadable_metadata"},
+        ])
+        self.assertTrue(infinite.exists())
+        self.assertTrue(offset.exists())
+
+    def test_recent_prompt_at_end_of_walk_skips_hashing_all_attachments(self) -> None:
+        directory = self.make_job()
+        # prompt.txt sorts after the entire files/ subtree.
+        os.utime(directory / "prompt.txt", (NOW.timestamp(), NOW.timestamp()))
+        with patch.object(tasks, "_prune_file_digest", side_effect=AssertionError("hashed before recency check")):
+            self.assert_protected(directory, "recent_write")
+
+    @unittest.skipUnless(os.name == "nt", "Windows mandatory sharing protection")
+    def test_final_delete_boundary_rejects_ancestor_rename_and_junction_redirection(self) -> None:
+        directory = self.make_job()
+        external_root = self.temp_dir / "synthetic-outside-managed-root"
+        external = self.make_job(root=external_root, job_id=directory.name)
+        before = self.tree_snapshot(external)
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        original = safe_delete.ProtectedTree.delete
+        attempted = []
+
+        def attack_and_delete(protection):
+            # This was the old post-fingerprint/pre-rmtree attack boundary.
+            # Real rename/junction operations; do not release/bypass protection.
+            for parent in (directory.parent, self.jobs_root, self.temp_dir):
+                backup = parent.with_name(parent.name + "-synthetic-renamed")
+                try:
+                    parent.rename(backup)
+                except OSError as exc:
+                    self.assertIn(exc.winerror, (5, 32, 33))
+                    attempted.append(parent)
+                else:
+                    # A regression must never proceed to a deletion using the
+                    # substitute. Restore the temp tree before failing the test.
+                    parent.symlink_to(external_root / "Ready", target_is_directory=True)
+                    self.remove_directory_link(parent)
+                    backup.rename(parent)
+                    self.fail("protected ancestor was renamed")
+            return original(protection)
+
+        with patch.object(safe_delete.ProtectedTree, "delete", attack_and_delete):
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(len(attempted), 3)
+        self.assertEqual(result["removed"], [directory.name])
+        self.assertEqual(self.tree_snapshot(external), before)
+
+    @unittest.skipUnless(os.name == "nt", "Windows mandatory sharing protection")
+    def test_late_junction_is_rejected_before_final_validation(self) -> None:
+        directory = self.make_job()
+        external = self.make_job(root=self.temp_dir / "external-synthetic", job_id=directory.name)
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        saved = self.temp_dir / "saved-synthetic-job"
+        directory.rename(saved)
+        self.directory_link(directory, external)
+        before = self.tree_snapshot(external)
+        result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"], [{"jobId": directory.name, "reason": "unsafe_path"}])
+        self.assertEqual(self.tree_snapshot(external), before)
+        self.assertTrue(saved.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows mandatory sharing protection")
+    def test_same_length_restored_mtime_write_after_real_digest_is_os_denied(self) -> None:
+        directory = self.make_job()
+        artifact = directory / "files" / "chat.md"
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        original = tasks._prune_file_digest
+        attempted = []
+
+        def digest_then_write(path, before, protection=None):
+            digest = original(path, before, protection)
+            if path == artifact:
+                attempted.append(path)
+                try:
+                    artifact.write_bytes(b"x" * before.st_size)
+                    os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+                except OSError as exc:
+                    self.assertTrue(exc.errno == 13 or exc.winerror in (5, 32, 33))
+                else:
+                    self.fail("noncooperative same-size rewrite succeeded while protected")
+            return digest
+
+        with patch.object(tasks, "_prune_file_digest", digest_then_write):
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(attempted, [artifact])
+        self.assertEqual(result["removed"], [directory.name])
+
+    @unittest.skipUnless(os.name == "nt", "Windows mandatory sharing protection")
+    def test_file_and_candidate_replace_at_delete_boundary_are_os_denied(self) -> None:
+        directory = self.make_job()
+        artifact = directory / "files" / "chat.md"
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        replacement = self.temp_dir / "replacement-synthetic.md"
+        replacement.write_bytes(b"unconfirmed synthetic replacement")
+        original = safe_delete.ProtectedTree.delete
+
+        def attack_and_delete(protection):
+            for action in (
+                lambda: os.replace(replacement, artifact),
+                lambda: artifact.rename(artifact.with_name("renamed.md")),
+                lambda: directory.rename(directory.with_name("renamed-job")),
+            ):
+                with self.assertRaises(OSError):
+                    action()
+            return original(protection)
+
+        with patch.object(safe_delete.ProtectedTree, "delete", attack_and_delete):
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [directory.name])
+        self.assertEqual(replacement.read_bytes(), b"unconfirmed synthetic replacement")
+
+    @unittest.skipUnless(os.name == "nt", "Windows mandatory sharing protection")
+    def test_existing_writer_or_writable_mapping_refuses_cleanup_and_releases_handles(self) -> None:
+        for mapped in (False, True):
+            with self.subTest(mapped=mapped):
+                directory = self.make_job()
+                artifact = directory / "files" / "chat.md"
+                snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+                snapshot["jobs"] = [item for item in snapshot["jobs"] if item["jobId"] == directory.name]
+                with artifact.open("r+b") as writer:
+                    view = mmap.mmap(writer.fileno(), 0, access=mmap.ACCESS_WRITE) if mapped else None
+                    if mapped:
+                        writer.close()  # The writable mapping alone must refuse protection.
+                    try:
+                        result = self.service.prune_jobs(30, snapshot=snapshot)
+                    finally:
+                        if view is not None:
+                            view.close()
+                self.assertEqual(result["removed"], [])
+                self.assertEqual(result["skipped"], [{"jobId": directory.name, "reason": "in_use"}])
+                artifact.write_bytes(b"now writable after guard released")
+                moved = directory.with_name(directory.name + "-released")
+                directory.rename(moved)
+                moved.rename(directory)
+
+    @unittest.skipUnless(os.name == "nt", "Windows native share modes")
+    def test_existing_writer_that_shares_everything_still_blocks_protection(self) -> None:
+        directory = self.make_job()
+        artifact = directory / "files" / "chat.md"
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        api = safe_delete._WindowsApi()
+        handle = api.dll.CreateFileW(str(artifact), 0x40000000, 7, None, 3, 0, None)
+        self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+        try:
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        finally:
+            api.dll.CloseHandle(handle)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"], [{"jobId": directory.name, "reason": "in_use"}])
+        artifact.write_bytes(b"writer closed, synthetic file remains writable")
+        self.assertTrue(directory.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows native share modes")
+    def test_native_writer_sharing_delete_is_also_denied_after_hash(self) -> None:
+        directory = self.make_job()
+        artifact = directory / "files" / "chat.md"
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        original = tasks._prune_file_digest
+        attempted = []
+
+        def digest_then_open_writer(path, before, protection=None):
+            digest = original(path, before, protection)
+            if path == artifact:
+                # Unlike CRT open(), this attacker shares DELETE correctly.
+                # Denial must come from our deny-WRITE, not their share flags.
+                handle = protection._api.dll.CreateFileW(str(path), 0x40000000, 7, None, 3, 0, None)
+                error = ctypes.get_last_error()
+                if handle != ctypes.c_void_p(-1).value:
+                    protection._api.dll.CloseHandle(handle)
+                    self.fail("native writer obtained write access to a hashed file")
+                self.assertIn(error, (5, 32, 33))
+                attempted.append(path)
+            return digest
+
+        with patch.object(tasks, "_prune_file_digest", digest_then_open_writer):
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(attempted, [artifact])
+        self.assertEqual(result["removed"], [directory.name])
+
+    def test_unsupported_protection_fails_closed_without_path_delete_fallback(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        before = self.tree_snapshot(directory)
+        with patch.object(safe_delete, "_WindowsApi", side_effect=AttributeError("missing API private path")):
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"], [{"jobId": directory.name, "reason": "safe_delete_unavailable"}])
+        self.assertEqual(self.tree_snapshot(directory), before)
+        self.assertNotIn("private path", json.dumps(result))
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle lifecycle")
+    def test_partial_acquisition_and_digest_exceptions_release_all_handles(self) -> None:
+        for boundary in ("open", "digest"):
+            with self.subTest(boundary=boundary):
+                directory = self.make_job()
+                snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+                snapshot["jobs"] = [item for item in snapshot["jobs"] if item["jobId"] == directory.name]
+                if boundary == "open":
+                    original = safe_delete._WindowsApi.open
+
+                    def fail_late(api, native_path, *, deletable):
+                        if native_path.endswith("image.bin"):
+                            raise OSError("synthetic acquisition failure")
+                        return original(api, native_path, deletable=deletable)
+
+                    hook = patch.object(safe_delete._WindowsApi, "open", fail_late)
+                else:
+                    hook = patch.object(tasks, "_prune_file_digest", side_effect=OSError("synthetic digest failure"))
+                with hook:
+                    result = self.service.prune_jobs(30, snapshot=snapshot)
+                self.assertEqual(result["removed"], [])
+                # These real operations fail if *any* directory/file fd leaked.
+                for path in directory.rglob("*"):
+                    if path.is_file():
+                        with path.open("r+b") as writer:
+                            writer.write(b"x")
+                moved = directory.parent.with_name("Ready-" + directory.name + "-released")
+                directory.parent.rename(moved)
+                moved.rename(directory.parent)
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle lifecycle")
+    def test_volume_api_failure_releases_the_already_acquired_root_handle(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        original_close = safe_delete.os.close
+        closed = []
+
+        def record_close(fd):
+            original_close(fd)
+            closed.append(fd)
+
+        with patch.object(safe_delete._WindowsApi, "volume_root", side_effect=OSError("synthetic volume failure")), \
+                patch.object(safe_delete.os, "close", record_close):
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"], [{"jobId": directory.name, "reason": "protection_failed"}])
+        self.assertEqual(len(closed), 1)
+        with self.assertRaises(OSError):
+            os.fstat(closed[0])
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle-bound deletion")
+    def test_partial_disposition_failure_returns_skip_and_releases_remaining_tree(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        original = safe_delete._WindowsApi.dispose
+        calls = []
+
+        def fail_after_one(api, handle):
+            calls.append(handle)
+            if len(calls) == 2:
+                raise PermissionError("synthetic disposition failure")
+            return original(api, handle)
+
+        with patch.object(safe_delete._WindowsApi, "dispose", fail_after_one):
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"], [{"jobId": directory.name, "reason": "delete_failed"}])
+        self.assertEqual(len(calls), 2)
+        self.assertTrue((directory / "manifest.json").is_file())
+        self.assertTrue((directory / "state.json").is_file())
+        for path in directory.rglob("*"):
+            if path.is_file():
+                with path.open("r+b") as writer:
+                    writer.write(b"x")
+        backup = directory.with_name(directory.name + "-released")
+        directory.rename(backup)
+        backup.rename(directory)
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle-bound deletion")
+    def test_child_added_after_final_membership_check_is_not_deleted(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        added = directory / "files" / "new-unconfirmed.bin"
+        original = safe_delete._WindowsApi.dispose
+        calls = []
+
+        def add_after_check(api, handle):
+            if not calls:
+                # This boundary is after delete() checked membership. The
+                # nonrecursive handle plan must not expand to include this file.
+                added.write_bytes(b"late unconfirmed synthetic bytes")
+            calls.append(handle)
+            return original(api, handle)
+
+        with patch.object(safe_delete._WindowsApi, "dispose", add_after_check):
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"], [{"jobId": directory.name, "reason": "delete_failed"}])
+        self.assertEqual(added.read_bytes(), b"late unconfirmed synthetic bytes")
+        self.assertTrue((directory / "manifest.json").is_file())
+        self.assertTrue((directory / "state.json").is_file())
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle-bound deletion")
+    def test_new_child_is_not_adopted_or_deleted(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        added = directory / "new-unconfirmed.bin"
+        original = safe_delete.ProtectedTree.delete
+
+        def add_then_delete(protection):
+            added.write_bytes(b"unconfirmed synthetic bytes")
+            return original(protection)
+
+        with patch.object(safe_delete.ProtectedTree, "delete", add_then_delete):
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"], [{"jobId": directory.name, "reason": "changed"}])
+        self.assertEqual(added.read_bytes(), b"unconfirmed synthetic bytes")
+        self.assertTrue((directory / "manifest.json").exists())
+
+    def test_deletion_failure_is_not_reported_as_success_and_has_no_fallback(self) -> None:
+        directory = self.make_job()
+        snapshot = self.service.preview_prune_jobs(30)["snapshot"]
+        with patch.object(safe_delete._WindowsApi, "dispose", side_effect=PermissionError("private path")) as deletion:
+            result = self.service.prune_jobs(30, snapshot=snapshot)
+        deletion.assert_called_once()
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["skipped"], [{"jobId": directory.name, "reason": "delete_failed"}])
+        self.assertNotIn("private path", json.dumps(result))
+        self.assertTrue(directory.is_dir())
+
+
+if __name__ == "__main__":
+    unittest.main()

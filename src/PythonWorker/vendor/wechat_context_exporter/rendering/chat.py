@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 from ..models import Conversation, Message, MessageType
 from .config import PageConfig, RenderTheme
-from .fonts import FontBook, draw_text_with_fallback, text_length_with_fallback
+from .fonts import FontBook, draw_text_with_fallback, single_line_metadata, text_length_with_fallback
 from .scaled_draw import ScaledDraw
 
 
@@ -231,7 +231,7 @@ class ChatRenderer:
         draw_text_with_fallback(
             draw,
             (self.config.margin_x, 24),
-            conversation.name,
+            single_line_metadata(conversation.name),
             self.title_font,
             self.title_emoji_font,
             self.theme.ink,
@@ -273,7 +273,9 @@ class ChatRenderer:
         left = self.config.margin_x + 18
         if message.is_outgoing:
             left = self.config.width - self.config.margin_x - 18 - block.width
-        sender = f"{message.sender} (continued)" if block.continuation else message.sender
+        sender = single_line_metadata(message.sender)
+        if block.continuation:
+            sender += " (continued)"
         time_text = message.timestamp.strftime("%H:%M")
         draw_text_with_fallback(
             draw,
@@ -328,7 +330,7 @@ class ChatRenderer:
             draw_text_with_fallback(
                 draw,
                 (left + 27, text_y + 4),
-                f"Reply to {message.reply_to}",
+                f"Reply to {single_line_metadata(message.reply_to)}",
                 self.small_font,
                 self.small_emoji_font,
                 self.theme.muted,

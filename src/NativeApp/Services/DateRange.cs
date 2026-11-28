@@ -24,3 +24,20 @@ public sealed record DateRange(string? StartDate, string? EndDate)
     public string Label => StartDate is null && EndDate is null ? "全部日期 · UTC+08:00" :
         $"{StartDate ?? "不限"} 至 {EndDate ?? "不限"}（含首尾日期）· UTC+08:00";
 }
+
+/// <summary>
+/// Validates the filters a newly imported source will immediately use before
+/// running an operation with source-switching side effects.
+/// </summary>
+public static class OfflineImportPreflight
+{
+    public static async Task<T> ExecuteAsync<T>(
+        DateTimeOffset? start,
+        DateTimeOffset? end,
+        Func<Task<T>> import)
+    {
+        ArgumentNullException.ThrowIfNull(import);
+        _ = DateRange.Create(start, end);
+        return await import();
+    }
+}

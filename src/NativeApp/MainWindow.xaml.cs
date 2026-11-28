@@ -130,6 +130,23 @@ public sealed partial class MainWindow : Window
         await Vm.ConnectWechatCommand.ExecuteAsync(null);
     }
 
+    private async void ImportJson_Click(object sender, RoutedEventArgs e)
+    {
+        if (!Vm.CanImportJson) return;
+        try
+        {
+            var picker = new FileOpenPicker { SuggestedStartLocation = PickerLocationId.DocumentsLibrary };
+            WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
+            picker.FileTypeFilter.Add(".json");
+            var file = await picker.PickSingleFileAsync();
+            if (file is not null) await Vm.ImportJsonAsync(file.Path);
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or UnauthorizedAccessException or IOException or ArgumentException)
+        {
+            Vm.ShowError("无法选择 JSON 文件。请选择当前用户有权限读取的本地 .json 文件。", "IMPORT_PICKER_FAILED");
+        }
+    }
+
     private async void Export_Click(object sender, RoutedEventArgs e)
     {
         if (!Vm.CanExport || sender is not Button button) return;
@@ -205,23 +222,210 @@ public sealed partial class MainWindow : Window
 
     private async void OpenJobFolder_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: JobSummary job }) return;
-        if (string.IsNullOrWhiteSpace(job.Directory) || !Directory.Exists(job.Directory))
+        if (!Vm.CanManageJobs || sender is not FrameworkElement { DataContext: JobSummary job }) return;
+        // Resolve the directory from the validated get_job record, not from any
+        // manifest/state field, and launch through the StorageFolder boundary.
+        var detail = await Vm.LoadJobDetailAsync(job);
+        string? directory = detail?.Job.Directory;
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
         {
             Vm.ShowError("任务目录不存在或已被移动。", "OPEN_FOLDER_FAILED");
             return;
         }
-        await LaunchPathAsync(job.Directory, "无法打开任务目录。", "OPEN_FOLDER_FAILED");
+        await LaunchPathAsync(directory, "无法打开任务目录。", "OPEN_FOLDER_FAILED");
+    }
+
+    private async void ShowJobDetail_Click(object sender, RoutedEventArgs e)
+    {
+        if (!Vm.CanManageJobs || sender is not FrameworkElement { DataContext: JobSummary selected }) return;
+        var detail = await Vm.LoadJobDetailAsync(selected);
+        if (detail is null) return;
+
+        var job = detail.Job;
+        var content = new StackPanel { Spacing = 7, MaxWidth = 680 };
+        void AddField(string label, string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return;
+            content.Children.Add(new TextBlock
+            {
+                Text = $"{label}：{value}",
+                TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap,
+                IsTextSelectionEnabled = true,
+            });
+        }
+
+        AddField("状态", job.StatusLabel);
+        AddField("创建时间", job.CreatedAtDetailLabel);
+        AddField("更新时间", job.UpdatedAtDetailLabel);
+        AddField("会话", string.IsNullOrWhiteSpace(job.ConversationName) ? "会话名称未提供" : job.ConversationName);
+        AddField("消息数", job.MessageCount is int messageCount ? $"{messageCount:N0}" : "未提供");
+        AddField("会话标识", job.ConversationId);
+        AddField("场景", job.SceneName);
+        AddField("来源", detail.SourceLabel);
+        AddField("日期范围", detail.Start is null && detail.End is null ? null : $"{detail.Start ?? "未提供"} 至 {detail.End ?? "未提供"}");
+        AddField("关键词", detail.Query);
+        AddField("目标", job.Target);
+        AddField("外部投递位置", job.Destination);
+        AddField("任务说明", job.Detail);
+        AddField("错误", job.Error);
+        if (job.Attempts is int attempts) AddField("尝试次数", attempts.ToString("N0"));
+        if (job.Retryable is bool retryable) AddField("可重试", retryable ? "是" : "否");
+        if (job.Status is "ready" or "failed") AddField("重新投递", "当前状态允许");
+        else if (job.Status is "delivered" or "copied" or "expired" or "running" or "pending")
+            AddField("重新投递", "当前状态不允许");
+
+        if (job.Artifacts is null)
+        {
+            AddField("工件", "工件信息未提供");
+        }
+        else if (job.Artifacts.Count == 0)
+        {
+            AddField("工件", "没有工件记录");
+        }
+        else
+        {
+            AddField("本地工件", $"{job.Artifacts.Count:N0} 项");
+            foreach (var artifact in job.Artifacts.Take(20))
+            {
+                var row = new Grid { ColumnSpacing = 8 };
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                string size = artifact.Size is long bytes ? $"{bytes:N0} 字节" : "大小未提供";
+                var label = new TextBlock
+                {
+                    Text = $"{artifact.Name} · {artifact.Kind ?? "类型未提供"} · {size}",
+                    TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap,
+                    VerticalAlignment = Microsoft.UI.Xaml.VerticalAlignment.Center,
+                    IsTextSelectionEnabled = true,
+                };
+                var open = new Button { Content = "打开文件", FontSize = 11, Padding = new Thickness(8, 2, 8, 2) };
+                open.Click += async (_, _) =>
+                {
+                    if (!Vm.CanManageJobs) return;
+                    string? path = await Vm.ResolveJobArtifactPathAsync(job, artifact);
+                    if (path is not null)
+                        await LaunchPathAsync(path, "无法打开任务文件；文件可能不存在或未通过安全路径检查。", "OPEN_JOB_ARTIFACT_FAILED");
+                };
+                row.Children.Add(label);
+                Grid.SetColumn(open, 1);
+                row.Children.Add(open);
+                content.Children.Add(row);
+            }
+            if (job.Artifacts.Count > 20) AddField("工件列表", "仅显示前 20 项。");
+        }
+
+        if (!string.IsNullOrWhiteSpace(job.Directory))
+        {
+            var openDirectory = new Button { Content = "打开任务目录", HorizontalAlignment = Microsoft.UI.Xaml.HorizontalAlignment.Left };
+            openDirectory.Click += async (_, _) =>
+            {
+                if (!Vm.CanManageJobs) return;
+                if (!Directory.Exists(job.Directory))
+                {
+                    Vm.ShowError("任务目录不存在或已被移动。", "OPEN_FOLDER_FAILED");
+                    return;
+                }
+                await LaunchPathAsync(job.Directory, "无法打开任务目录。", "OPEN_FOLDER_FAILED");
+            };
+            content.Children.Add(openDirectory);
+        }
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = Root.XamlRoot,
+            Title = "任务详情",
+            Content = new ScrollViewer
+            {
+                Content = content,
+                MaxHeight = 540,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            },
+            CloseButtonText = "关闭",
+            DefaultButton = ContentDialogButton.Close,
+        };
+        await dialog.ShowAsync();
+    }
+
+    private async void CleanupJobs_Click(object sender, RoutedEventArgs e)
+    {
+        var workflow = Vm.TryBeginPruneWorkflow();
+        if (workflow is null) return;
+        try
+        {
+            var preview = await Vm.PreviewPruneJobsAsync(Vm.PruneRetentionDays);
+            if (preview is null) return;
+
+            var previewContent = new StackPanel { Spacing = 8, MaxWidth = 620 };
+            void AddPreviewLine(string text) => previewContent.Children.Add(new TextBlock
+            {
+                Text = text,
+                TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap,
+                IsTextSelectionEnabled = true,
+            });
+            AddPreviewLine($"保留期限：{preview.Days} 天；截止时间：{preview.Cutoff}");
+            AddPreviewLine($"只读预览候选：{preview.CandidateCount:N0} 个旧的已完成任务。");
+            AddPreviewLine($"可统计的本地工件逻辑字节：{preview.KnownArtifactBytes:N0} 字节；这不等于磁盘实际可释放空间。");
+            AddPreviewLine($"跳过或无法统计：{preview.UnknownSizeCount:N0} 项。未统计条目不是额外的可删除候选。");
+            string previewReasons = MainViewModel.FormatPruneReasonCounts(preview.SkippedReasonCounts);
+            if (previewReasons.Length > 0) AddPreviewLine("跳过原因摘要：" + previewReasons);
+            AddPreviewLine("此步骤只读，不会删除文件。不会后台自动清理。预览确认授权有效期为 10 分钟；过期后需重新预览。");
+
+            var previewDialog = new ContentDialog
+            {
+                XamlRoot = Root.XamlRoot,
+                Title = "任务历史清理预览",
+                Content = new ScrollViewer { Content = previewContent, MaxHeight = 500, VerticalScrollBarVisibility = ScrollBarVisibility.Auto },
+                PrimaryButtonText = preview.HasCandidates ? "继续到永久删除确认" : "",
+                CloseButtonText = "关闭",
+                DefaultButton = ContentDialogButton.Close,
+            };
+            if (await previewDialog.ShowAsync() != ContentDialogResult.Primary || !preview.HasCandidates) return;
+
+            const string confirmationText = "这将永久删除应用管理的本地任务副本，且不移入回收站；发生错误时可能只删除部分任务。不会删除外部文件夹或 Obsidian 中已投递的副本，也不会删除用户提供的 JSON 原件。未完成或可恢复任务不会作为候选。\n\n安全删除仅支持 Windows 本地固定 NTFS 卷；文件占用、无法建立安全保护或当前卷不支持时会跳过。后端会重新检查可识别的状态和安全条件，但不能保证覆盖所有外部并发修改。\n\n重要：选中任务文件的 NTFS 备用数据流（ADS）不在预览、变化校验或防写保护范围内，会随宿主文件一起删除，包括确认后新增的流。如在 ADS 另存数据，请取消并先备份。\n\n若执行期间工作进程连接丢失，可能已有部分任务被永久删除，请重新打开并刷新任务历史核实。";
+            var confirmation = new ContentDialog
+            {
+                XamlRoot = Root.XamlRoot,
+                Title = "永久删除这些任务？",
+                Content = new ScrollViewer
+                {
+                    Content = new TextBlock { Text = confirmationText, TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap },
+                    MaxHeight = 500,
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                },
+                PrimaryButtonText = "永久删除这些任务",
+                CloseButtonText = "取消",
+                DefaultButton = ContentDialogButton.Close,
+            };
+            if (await confirmation.ShowAsync() != ContentDialogResult.Primary) return;
+
+            var result = await Vm.ConfirmPruneJobsAsync(preview);
+            if (result is null) return;
+            var presentation = PruneResultPresentation.Create(result);
+            var resultDialog = new ContentDialog
+            {
+                XamlRoot = Root.XamlRoot,
+                Title = presentation.Title,
+                Content = presentation.Summary,
+                CloseButtonText = "关闭",
+                DefaultButton = ContentDialogButton.Close,
+            };
+            await resultDialog.ShowAsync();
+        }
+        finally
+        {
+            workflow.Dispose();
+        }
     }
 
     private async void DeliverJob_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: JobSummary job }) return;
+        if (!Vm.CanManageJobs || sender is not FrameworkElement { DataContext: JobSummary job }) return;
         if (!job.CanRedeliver)
         {
             Vm.ShowError("只有待投递或失败的任务可以重新投递。", "JOB_NOT_READY");
             return;
         }
+        if (!Vm.CanRetryJob(job)) return;
         if (Vm.TargetKind == "none")
         {
             Vm.ShowError("请先在任务页选择“复制到文件夹”或“复制到 Obsidian 仓库”。", "INVALID_ARGUMENT");
@@ -283,6 +487,31 @@ public sealed partial class MainWindow : Window
         if (_allowClose) return;
         args.Cancel = true;
         if (_closeInProgress) return;
+        if (Vm.IsPruneExecuting)
+        {
+            _closeInProgress = true;
+            ContentDialogResult choice;
+            try
+            {
+                var warning = new ContentDialog
+                {
+                    XamlRoot = Root.XamlRoot,
+                    Title = "清理仍在执行",
+                    Content = "关闭会终止工作进程。清理可能已经永久删除部分任务，关闭时无法确认完整结果。建议继续等待；若仍要关闭，请在下次启动后刷新任务历史核实。",
+                    PrimaryButtonText = "仍要关闭并停止工作进程",
+                    CloseButtonText = "继续等待",
+                    DefaultButton = ContentDialogButton.Close,
+                };
+                choice = await warning.ShowAsync();
+            }
+            catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException)
+            {
+                _closeInProgress = false;
+                return;
+            }
+            _closeInProgress = false;
+            if (choice != ContentDialogResult.Primary) return;
+        }
         _closeInProgress = true;
         Root.IsHitTestVisible = false;
         try { await Vm.DisposeAsync(); AppLog.Write("app_closed"); }

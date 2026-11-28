@@ -14,6 +14,9 @@
   <Compile Include="../../src/NativeApp/Services/Protocol.cs" Link="Services/Protocol.cs" />
   <Compile Include="../../src/NativeApp/Services/DateRange.cs" Link="Services/DateRange.cs" />
   <Compile Include="../../src/NativeApp/Services/WorkerClient.cs" Link="Services/WorkerClient.cs" />
+  <Compile Include="../../src/NativeApp/Services/OperationGate.cs" Link="Services/OperationGate.cs" />
+  <Compile Include="../../src/NativeApp/Services/TaskHistoryWorkflow.cs" Link="Services/TaskHistoryWorkflow.cs" />
   <None Include="fixtures/fake_worker.py" CopyToOutputDirectory="PreserveNewest" />
+  <None Include="fixtures/partial_prune_result.json" CopyToOutputDirectory="PreserveNewest" />
  </ItemGroup>
 </Project>

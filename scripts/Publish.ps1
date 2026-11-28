@@ -1,5 +1,7 @@
 ﻿param(
-    [switch]$SkipSmokeTest
+    [switch]$SkipSmokeTest,
+    [string]$OutputRoot,
+    [switch]$SkipDependencyInstall
 )
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/Common.ps1"
@@ -7,21 +9,34 @@ Push-Location $ProjectRoot
 try {
     $dotnet = Get-ProjectDotnet
     $python = Get-ProjectPython
-    $publishRoot = Join-Path $ProjectRoot 'artifacts/publish'
-    $publishDir = Join-Path $ProjectRoot '微信记忆App'
+    $isolatedOutput = -not [string]::IsNullOrWhiteSpace($OutputRoot)
+    if ($isolatedOutput) {
+        $publishRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputRoot)
+        if (Test-Path -LiteralPath $publishRoot) { throw 'OutputRoot already exists; choose a new directory.' }
+        $publishDir = Join-Path $publishRoot '微信记忆App'
+    } else {
+        $publishRoot = Join-Path $ProjectRoot 'artifacts/publish'
+        $publishDir = Join-Path $ProjectRoot '微信记忆App'
+    }
     $workerDist = Join-Path $publishRoot 'worker-dist'
     $workerWork = Join-Path $publishRoot 'worker-build'
     $workerSpec = Join-Path $publishRoot 'worker-spec'
     $project = Join-Path $ProjectRoot 'src/NativeApp/WeChat-History.csproj'
 
-    foreach ($dir in @($publishDir, $workerDist, $workerWork, $workerSpec)) {
-        if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+    if (-not $isolatedOutput) {
+        foreach ($dir in @($publishDir, $workerDist, $workerWork, $workerSpec)) {
+            if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+        }
     }
     New-Item -ItemType Directory -Force -Path $publishDir, $workerDist, $workerWork, $workerSpec | Out-Null
 
     $buildRequirements = Join-Path $ProjectRoot 'src/PythonWorker/requirements-build.txt'
     if (-not (Test-Path -LiteralPath $buildRequirements)) { throw 'src/PythonWorker/requirements-build.txt is missing.' }
-    Invoke-Checked $python @('-I','-m','pip','install','--disable-pip-version-check','-r',$buildRequirements)
+    if ($SkipDependencyInstall) {
+        Invoke-Checked $python @('-I','-m','pip','check')
+    } else {
+        Invoke-Checked $python @('-I','-m','pip','install','--disable-pip-version-check','-r',$buildRequirements)
+    }
 
     Write-Output 'Publishing native app (self-contained win-x64)...'
     Invoke-Checked $dotnet @(
@@ -86,7 +101,7 @@ try {
     # smoke-tested from the project fixture without shipping it.
     $demoFile = Join-Path $ProjectRoot 'demo/conversations.json'
 
-    foreach ($name in @('THIRD_PARTY_NOTICES.md', 'README.md')) {
+    foreach ($name in @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md')) {
         $source = Join-Path $ProjectRoot $name
         if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination $publishDir -Force }
     }

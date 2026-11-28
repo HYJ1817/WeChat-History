@@ -12,10 +12,15 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
 {
     private readonly DispatcherQueue _dispatcher;
     private readonly bool _demoMode;
+    private bool _offlineMode;
+    private string? _offlinePath;
     private WorkerClient? _worker;
     private int? _nextOffset;
     private DateRange _applied = new(null, null);
     private readonly Dictionary<string, string> _accountNames = new(StringComparer.Ordinal);
+    private readonly OperationGate _operationGate = new();
+    private readonly DisconnectStatusGuard _disconnectStatusGuard = new();
+    private bool _pruneWorkflowActive;
     private bool _closing;
     private bool _suppressSceneDates;
     private ConnectionMedia? _connectedMedia;
@@ -57,30 +62,44 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
     [ObservableProperty] public partial string CustomSceneName { get; set; } = "";
     [ObservableProperty] public partial string CustomScenePrompt { get; set; } = "";
     [ObservableProperty] public partial string AccountHint { get; set; } = "正在检测微信账户…";
+    [ObservableProperty] public partial int PruneRetentionDays { get; set; } = 30;
+    [ObservableProperty] public partial bool IsPruneExecuting { get; set; }
 
-    public bool CanWork => IsConnected && !IsBusy;
-    public bool CanExport => CanWork && SelectedConversation is not null && !FiltersDirty;
+    public IReadOnlyList<int> PruneRetentionDayOptions { get; } = [30, 90, 180, 365];
+    public bool CanStartOperation => _operationGate.CanStart(IsBusy, _closing);
+    public bool CanWork => _operationGate.CanStart(IsBusy, _closing) && IsConnected;
+    public bool CanManageJobs => _operationGate.CanManageJobs(IsBusy, _closing, _worker?.IsAvailable == true);
+    public bool CanExport => _operationGate.CanExport(IsBusy, _closing, IsConnected, SelectedConversation is not null, !FiltersDirty);
     public bool CanLoadMore => CanExport && _nextOffset is not null;
     public bool HasError => Error.Length > 0;
     public bool HasResult => ResultPath.Length > 0;
     public bool HasResultSummary => ResultSummary.Length > 0;
     public bool IsEmpty => !IsBusy && Messages.Count == 0;
     public string SelectedTitle => SelectedConversation?.Title ?? "消息预览";
-    public bool CanConnect => !IsBusy;
-    public bool CanConnectWechat => !IsBusy && !IsConnected && Accounts.Count > 0;
-    public bool CanTranscribe => CanWork && SelectedConversation is not null && EnableVoice && !FiltersDirty
+    public bool CanConnect => _operationGate.CanReconnect(IsBusy, _closing);
+    public bool CanConnectWechat => _operationGate.CanConnectWechat(IsBusy, _closing, IsConnected, Accounts.Count > 0);
+    public bool CanImportJson => _operationGate.CanImportJson(IsBusy, _closing, _worker?.IsAvailable == true);
+    public bool CanTranscribe => CanWork && !_offlineMode && SelectedConversation is not null && EnableVoice && !FiltersDirty
         && (_demoMode || _connectedMedia?.VoiceReady == true);
-    public bool IsWechatMode => !_demoMode;
+    public bool IsWechatMode => !_demoMode && !_offlineMode;
+    public bool IsOfflineMode => _offlineMode;
     public bool IsDemoMode => _demoMode;
-    public string SourceLabel => _demoMode
-        ? "自动化测试数据 · 不读取微信"
-        : "本机微信 4.x · 只读 · 本地处理";
+    public string SourceLabel => _offlineMode
+        ? $"离线 JSON · 只读 · {OfflineFileName}"
+        : _demoMode ? "自动化测试数据 · 不读取微信" : "本机微信 4.x · 只读 · 本地处理";
+    public string SourceModeLabel => _offlineMode
+        ? "离线 JSON · 只读"
+        : _demoMode ? "自动化演示数据 · 只读" : "本机微信 4.x · 只读";
+    private string OfflineFileName => string.IsNullOrWhiteSpace(_offlinePath)
+        ? "已选择文件" : Path.GetFileName(_offlinePath);
     public string SelectedScenePrompt => SelectedScene?.Prompt ?? "";
     public bool HasScenePrompt => !string.IsNullOrWhiteSpace(SelectedScenePrompt);
     public bool CanSaveScene => CanWork && CustomSceneName.Trim().Length > 0 && CustomScenePrompt.Trim().Length > 0;
-    public bool CanDeleteScene => SelectedScene is { Builtin: false };
+    public bool CanDeleteScene => _operationGate.CanDeleteScene(IsBusy, _closing, SelectedScene is { Builtin: false });
     public bool HasJobs => Jobs.Count > 0;
-    public bool CanExportJob => CanWork && SelectedConversation is not null && !FiltersDirty && (ExportMarkdown || ExportJson || ExportPdf);
+    public bool CanExportJob => _operationGate.CanExport(
+        IsBusy, _closing, IsConnected, SelectedConversation is not null, !FiltersDirty) &&
+        (ExportMarkdown || ExportJson || ExportPdf);
 
     public IAsyncRelayCommand ReconnectCommand { get; }
     public IAsyncRelayCommand ConnectWechatCommand { get; }
@@ -103,10 +122,10 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         _dispatcher = dispatcher;
         _demoMode = StartupOptions.DemoMode;
         UseWechat = !_demoMode;
-        ReconnectCommand = new AsyncRelayCommand(InitializeAsync, () => !IsBusy);
+        ReconnectCommand = new AsyncRelayCommand(InitializeAsync, () => CanConnect);
         ConnectWechatCommand = new AsyncRelayCommand(ConnectWechatAsync, () => CanConnectWechat);
-        RefreshAccountsCommand = new AsyncRelayCommand(RefreshAccountsAsync, () => !IsBusy);
-        DisconnectCommand = new AsyncRelayCommand(DisconnectAsync, () => IsConnected && !IsBusy);
+        RefreshAccountsCommand = new AsyncRelayCommand(RefreshAccountsAsync, () => CanConnect);
+        DisconnectCommand = new AsyncRelayCommand(DisconnectAsync, () => CanWork);
         SearchConversationsCommand = new AsyncRelayCommand(SearchConversationsAsync, () => CanWork);
         ApplyFiltersCommand = new AsyncRelayCommand(() => RunAsync(() => FetchAsync(false), "正在筛选消息…"), () => CanWork && SelectedConversation is not null);
         ClearFiltersCommand = new AsyncRelayCommand(async () =>
@@ -118,7 +137,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         ExportJobCommand = new AsyncRelayCommand(ExportJobAsync, () => CanExportJob);
         SaveSceneCommand = new AsyncRelayCommand(SaveSceneAsync, () => CanSaveScene);
         DeleteSceneCommand = new AsyncRelayCommand(DeleteSceneAsync, () => CanDeleteScene);
-        RefreshJobsCommand = new AsyncRelayCommand(LoadJobsAsync, () => CanWork);
+        RefreshJobsCommand = new AsyncRelayCommand(LoadJobsAsync, () => CanManageJobs);
         TranscribeCommand = new AsyncRelayCommand(TranscribeAsync, () => CanTranscribe);
         RefreshVoiceCommand = new AsyncRelayCommand(RefreshVoiceStatusAsync, () => CanWork);
         PrepareVoiceCommand = new AsyncRelayCommand(PrepareVoiceModelAsync, () => CanWork);
@@ -232,9 +251,10 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
     {
         foreach (var name in new[]
         {
-            nameof(CanWork), nameof(CanExport), nameof(CanLoadMore), nameof(IsEmpty),
-            nameof(SelectedTitle), nameof(CanConnect), nameof(CanConnectWechat),
-            nameof(CanTranscribe), nameof(IsWechatMode), nameof(IsDemoMode), nameof(SourceLabel),
+            nameof(CanStartOperation), nameof(CanWork), nameof(CanExport), nameof(CanLoadMore), nameof(IsEmpty), nameof(CanManageJobs),
+            nameof(SelectedTitle), nameof(CanConnect), nameof(CanConnectWechat), nameof(CanImportJson),
+            nameof(CanTranscribe), nameof(IsWechatMode), nameof(IsOfflineMode), nameof(IsDemoMode),
+            nameof(SourceLabel), nameof(SourceModeLabel),
             nameof(CanSaveScene), nameof(CanDeleteScene), nameof(HasJobs), nameof(CanExportJob),
             nameof(SelectedScenePrompt), nameof(HasScenePrompt),
         }) OnPropertyChanged(name);
@@ -248,7 +268,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         RefreshVoiceCommand?.NotifyCanExecuteChanged(); PrepareVoiceCommand?.NotifyCanExecuteChanged();
     }
 
-    private string CurrentSource => UseWechat ? "wechat4" : "demo";
+    private string CurrentSource => _offlineMode ? "offline" : UseWechat ? "wechat4" : "demo";
 
     // ------------------------------------------------------------------ //
     // Connection
@@ -260,6 +280,8 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
     /// </summary>
     public Task InitializeAsync() => RunAsync(async () =>
     {
+        _offlineMode = false;
+        _offlinePath = null;
         _connectedMedia = null;
         IsConnected = false;
         Conversations.Clear(); Messages.Clear(); Jobs.Clear();
@@ -280,6 +302,7 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
 
         ConnectionLabel = "尚未连接";
         await RefreshAccountsCoreAsync(current);
+        await LoadJobsCoreAsync(current);
         Status = Accounts.Count == 0
             ? "没有找到微信账户。请先登录微信，然后点击“刷新”。"
             : $"找到 {Accounts.Count} 个微信账户。请选择账户后点击“连接微信”。";
@@ -303,7 +326,13 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
             if (_closing || !ReferenceEquals(_worker, current)) return;
             _connectedMedia = null;
             IsConnected = false; ConnectionLabel = "连接已断开";
-            Error = failure.Message; Status = "任务未完成，可重新检测。";
+            // A late disconnect notification must not erase the conservative
+            // PRUNE_RESULT_UNKNOWN warning for this worker instance.
+            if (!_disconnectStatusGuard.ShouldPreserve(current))
+            {
+                Error = failure.Message;
+                Status = "任务未完成，可重新检测。";
+            }
             AppLog.Write("worker_disconnected", failure.Code);
         });
         var hello = await current.RequestAsync("hello", new { });
@@ -367,6 +396,45 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
             : $"找到 {Accounts.Count} 个账户。连接会重启微信一次，连接后显示微信昵称。";
         UpdateFlags();
     }
+
+    public Task ImportJsonAsync(string path) => RunAsync(async () =>
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path) ||
+            !string.Equals(Path.GetExtension(path), ".json", StringComparison.OrdinalIgnoreCase))
+            throw new WorkerException("INVALID_ARGUMENT", "请选择绝对路径的 JSON 文件。");
+        var imported = await OfflineImportPreflight.ExecuteAsync(StartDate, EndDate, async () =>
+        {
+            var worker = _worker is { IsAvailable: true } ? _worker : await StartWorkerAsync();
+            var response = await worker.RequestAsync("import_json", new { path }, TimeSpan.FromSeconds(120));
+            return (Worker: worker, Response: response);
+        });
+        var current = imported.Worker;
+        var result = imported.Response.Deserialize<OfflineImportResult>(Protocol.Json)
+            ?? throw new WorkerException("PROTOCOL_ERROR", "离线导入结果格式不正确。");
+        if (!string.Equals(result.Source, "offline", StringComparison.Ordinal) ||
+            !string.Equals(result.Schema, "wechat-memory-json-v1", StringComparison.Ordinal) &&
+            !string.Equals(result.Schema, "demo-json-v1", StringComparison.Ordinal))
+            throw new WorkerException("PROTOCOL_ERROR", "工作进程返回了不兼容的离线数据源结果。");
+
+        // The worker commits its complete validated snapshot before this point;
+        // only now does the UI replace the active source and its visible state.
+        _offlineMode = true;
+        _offlinePath = path;
+        _connectedMedia = null;
+        IsConnected = true;
+        Accounts.Clear();
+        SelectedAccount = null;
+        AccountHint = "离线 JSON 已加载；不会读取微信、网络或 JSON 中指向的媒体文件。";
+        ConnectionLabel = "离线 JSON · 只读";
+        ResultPath = "";
+        ResultSummary = "";
+        OnPropertyChanged(nameof(SourceLabel));
+        OnPropertyChanged(nameof(SourceModeLabel));
+        await LoadConversationsAsync();
+        await RefreshAuxiliaryAsync(current);
+        Status = $"离线 JSON 已加载：{result.ConversationCount} 个会话，{result.MessageCount} 条消息。";
+        AppLog.Write("offline_json_imported");
+    }, "正在验证并导入离线 JSON…");
 
     private void RememberAccountName(string? name)
     {
@@ -596,6 +664,193 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
         catch (WorkerException) { }
     }
 
+    public async Task<JobDetail?> LoadJobDetailAsync(JobSummary job)
+    {
+        JobDetail? detail = null;
+        await RunAsync(async () =>
+        {
+            if (string.IsNullOrWhiteSpace(job.JobId))
+                throw new WorkerException("INVALID_ARGUMENT", "任务标识无效。");
+            var worker = _worker is { IsAvailable: true } current
+                ? current : throw new WorkerException("WORKER_EXITED", "工作进程不可用，请重新检测。");
+            var response = await worker.RequestAsync("get_job", new
+            {
+                jobId = job.JobId,
+                includePrompt = false,
+                includePreviews = false,
+            }, TimeSpan.FromSeconds(60));
+            var candidate = TaskHistoryResponseValidator.ParseJobDetail(job.JobId, response);
+            detail = candidate;
+            Status = "任务详情已加载。";
+        }, "正在读取任务详情…");
+        return detail;
+    }
+
+    public async Task<string?> ResolveJobArtifactPathAsync(JobSummary job, JobArtifact artifact)
+    {
+        string? resolvedPath = null;
+        await RunAsync(async () =>
+        {
+            if (string.IsNullOrWhiteSpace(job.JobId) || string.IsNullOrWhiteSpace(artifact.Name))
+                throw new WorkerException("INVALID_ARGUMENT", "任务文件信息无效。");
+            var worker = _worker is { IsAvailable: true } current
+                ? current : throw new WorkerException("WORKER_EXITED", "工作进程不可用，请重新检测。");
+            var response = await worker.RequestAsync("get_job_artifact_path", new
+            {
+                jobId = job.JobId,
+                name = artifact.Name,
+            }, TimeSpan.FromSeconds(60));
+            if (response.ValueKind != JsonValueKind.Object ||
+                !response.TryGetProperty("path", out var pathElement) ||
+                pathElement.ValueKind != JsonValueKind.String)
+                throw new WorkerException("PROTOCOL_ERROR", "任务文件路径结果格式不正确。");
+            string path = pathElement.GetString() ?? "";
+            if (!Path.IsPathFullyQualified(path) || !File.Exists(path))
+                throw new WorkerException("JOB_NOT_FOUND", "任务文件不存在或已被移动。");
+            resolvedPath = path;
+        }, "正在验证任务文件…");
+        return resolvedPath;
+    }
+
+    public bool CanRetryJob(JobSummary job) =>
+        _operationGate.CanRetry(IsBusy, _closing, _worker?.IsAvailable == true, job.CanRedeliver);
+
+    public IDisposable? TryBeginPruneWorkflow()
+    {
+        if (!CanManageJobs) return null;
+        var gateLease = _operationGate.TryEnter();
+        if (gateLease is null) return null;
+
+        _disconnectStatusGuard.Clear(_worker!);
+        IsBusy = true;
+        Error = "";
+        Status = "正在准备任务历史清理…";
+        ProgressLabel = "";
+        _pruneWorkflowActive = true;
+        return new CallbackLease(() =>
+        {
+            _pruneWorkflowActive = false;
+            gateLease.Dispose();
+            IsBusy = false;
+            ProgressLabel = "";
+        });
+    }
+
+    public async Task<PrunePreview?> PreviewPruneJobsAsync(int days)
+    {
+        if (!_pruneWorkflowActive || !IsBusy || _closing) return null;
+        try
+        {
+            if (!PruneRetentionDayOptions.Contains(days))
+                throw new WorkerException("INVALID_ARGUMENT", "请选择 30、90、180 或 365 天的保留期限。");
+            var worker = _worker is { IsAvailable: true } current
+                ? current : throw new WorkerException("WORKER_EXITED", "工作进程不可用，请重新检测。");
+            var response = await worker.RequestAsync("preview_prune_jobs", new { days }, TimeSpan.FromMinutes(10));
+            var candidate = TaskHistoryResponseValidator.ParsePrunePreview(days, response);
+            Status = candidate.CandidateCount == 0
+                ? "只读预览完成：没有符合条件的已完成任务。"
+                : $"只读预览完成：发现 {candidate.CandidateCount:N0} 个旧的已完成任务；尚未删除。";
+            return candidate;
+        }
+        catch (WorkerException error)
+        {
+            HandleWorkerFailure(error);
+            return null;
+        }
+        catch (Exception error) when (IsHandledResultFailure(error))
+        {
+            HandleResultFailure(error);
+            return null;
+        }
+    }
+
+    public async Task<PruneResult?> ConfirmPruneJobsAsync(PrunePreview preview)
+    {
+        if (!_pruneWorkflowActive || !IsBusy || _closing) return null;
+        WorkerClient? cleanupWorker = null;
+        try
+        {
+            if (preview.CandidateCount <= 0 || string.IsNullOrWhiteSpace(preview.PreviewToken) ||
+                !PruneRetentionDayOptions.Contains(preview.Days))
+                throw new WorkerException("PRUNE_PREVIEW_REQUIRED", "没有有效的清理预览；请重新预览。");
+            cleanupWorker = _worker is { IsAvailable: true } current
+                ? current : throw new WorkerException("WORKER_EXITED", "工作进程不可用，请重新检测。");
+
+            JsonElement response;
+            IsPruneExecuting = true;
+            try
+            {
+                // Never send the potentially multi-megabyte snapshot back to the
+                // worker. The token is bound to the previewed days server-side.
+                response = await cleanupWorker.RequestAsync("confirm_prune_jobs", new
+                {
+                    days = preview.Days,
+                    previewToken = preview.PreviewToken,
+                }, TimeSpan.FromMinutes(10));
+            }
+            catch (WorkerException error) when (IsPrunePreExecutionRejection(error.Code))
+            {
+                throw;
+            }
+            catch (WorkerException error)
+            {
+                throw UnknownPruneOutcome(error);
+            }
+            finally
+            {
+                IsPruneExecuting = false;
+            }
+
+            PruneResult parsedOutcome;
+            try
+            {
+                parsedOutcome = TaskHistoryResponseValidator.ParsePruneResult(preview.Days, response);
+            }
+            catch (WorkerException error)
+            {
+                throw UnknownPruneOutcome(error);
+            }
+
+            await LoadJobsCoreAsync(cleanupWorker);
+            Status = PruneResultPresentation.Create(parsedOutcome).Status;
+            return parsedOutcome;
+        }
+        catch (WorkerException error)
+        {
+            if (error.Code == "PRUNE_RESULT_UNKNOWN")
+            {
+                if (cleanupWorker is not null) _disconnectStatusGuard.Preserve(cleanupWorker);
+                Error = error.Message;
+                Status = "清理结果未知，请刷新任务历史核实。";
+                AppLog.Write("request_failed", error.Code);
+            }
+            else
+            {
+                HandleWorkerFailure(error);
+            }
+            return null;
+        }
+        catch (Exception error) when (IsHandledResultFailure(error))
+        {
+            HandleResultFailure(error);
+            return null;
+        }
+    }
+
+    private static bool IsPrunePreExecutionRejection(string code) => code is
+        "INVALID_ARGUMENT" or "UNKNOWN_COMMAND" or "PROTOCOL_MISMATCH" or
+        "PRUNE_PREVIEW_REQUIRED" or "PRUNE_PREVIEW_UNKNOWN" or
+        "PRUNE_PREVIEW_EXPIRED" or "PRUNE_PREVIEW_MISMATCH" or
+        "JOB_STORE_UNAVAILABLE" or "JOB_PATH_UNSAFE";
+
+    private static WorkerException UnknownPruneOutcome(WorkerException error) => new(
+        "PRUNE_RESULT_UNKNOWN",
+        "清理执行期间未收到完整结果，可能已有部分任务被永久删除。请刷新任务历史核实；不要根据此消息推断未删除。",
+        error);
+
+    public static string FormatPruneReasonCounts(IReadOnlyDictionary<string, int> counts) =>
+        PrunePreview.FormatReasonCounts(counts);
+
     public Task DeliverJobAsync(JobSummary job) => RunAsync(async () =>
     {
         object target = TargetKind switch
@@ -673,26 +928,50 @@ public partial class MainViewModel : ObservableObject, IAsyncDisposable
 
     private async Task RunAsync(Func<Task> operation, string status)
     {
-        if (IsBusy || _closing) return;
+        var gateLease = _operationGate.TryEnter();
+        if (gateLease is null || IsBusy || _closing)
+        {
+            gateLease?.Dispose();
+            return;
+        }
+        if (_worker is { } current) _disconnectStatusGuard.Clear(current);
         IsBusy = true; Error = ""; Status = status; ProgressLabel = "";
         try { await operation(); }
-        catch (WorkerException e)
+        catch (WorkerException error) { HandleWorkerFailure(error); }
+        catch (Exception error) when (IsHandledResultFailure(error)) { HandleResultFailure(error); }
+        finally
         {
-            Error = e.Message; Status = "任务未完成。"; AppLog.Write("request_failed", e.Code);
-            if (e.Code == "WECHAT_LOGIN_TIMEOUT")
-                AccountHint = "微信登录超时。请手动打开并登录微信，然后点击“刷新”再试。";
-            else if (e.Code == "WECHAT_KEY_UNAVAILABLE")
-                AccountHint = "无法读取微信进程。请确认微信能正常启动，必要时重启电脑后再试。";
-            else if (e.Code is "WECHAT_NOT_FOUND" or "WECHAT_EXE_NOT_FOUND")
-                AccountHint = "没有找到微信 4.x。请先安装并登录微信，然后点击“刷新”。";
-            if (_worker?.IsAvailable != true) { IsConnected = false; ConnectionLabel = "工作进程不可用"; }
+            gateLease.Dispose();
+            IsBusy = false;
+            ProgressLabel = "";
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or KeyNotFoundException or InvalidOperationException or FormatException)
-        {
-            Error = "处理结果失败。请重新连接或检查输出文件夹权限。"; Status = "任务未完成。";
-            AppLog.Write("result_failed", e.GetType().Name);
-        }
-        finally { IsBusy = false; ProgressLabel = ""; }
+    }
+
+    private void HandleWorkerFailure(WorkerException error)
+    {
+        Error = error.Message; Status = "任务未完成。"; AppLog.Write("request_failed", error.Code);
+        if (error.Code == "WECHAT_LOGIN_TIMEOUT")
+            AccountHint = "微信登录超时。请手动打开并登录微信，然后点击“刷新”再试。";
+        else if (error.Code == "WECHAT_KEY_UNAVAILABLE")
+            AccountHint = "无法读取微信进程。请确认微信能正常启动，必要时重启电脑后再试。";
+        else if (error.Code is "WECHAT_NOT_FOUND" or "WECHAT_EXE_NOT_FOUND")
+            AccountHint = "没有找到微信 4.x。请先安装并登录微信，然后点击“刷新”。";
+        if (_worker?.IsAvailable != true) { IsConnected = false; ConnectionLabel = "工作进程不可用"; }
+    }
+
+    private void HandleResultFailure(Exception error)
+    {
+        Error = "处理结果失败。请重新连接或检查输出文件夹权限。"; Status = "任务未完成。";
+        AppLog.Write("result_failed", error.GetType().Name);
+    }
+
+    private static bool IsHandledResultFailure(Exception error) =>
+        error is IOException or UnauthorizedAccessException or JsonException or KeyNotFoundException or InvalidOperationException or FormatException;
+
+    private sealed class CallbackLease(Action release) : IDisposable
+    {
+        private Action? _release = release;
+        public void Dispose() => Interlocked.Exchange(ref _release, null)?.Invoke();
     }
 
     public async ValueTask DisposeAsync()

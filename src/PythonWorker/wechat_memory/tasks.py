@@ -19,14 +19,19 @@ Privacy boundaries:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
+import stat
 import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
+
+from .safe_delete import ProtectedTree, SafeDeleteError
 
 _VENDOR_DIR = Path(__file__).resolve().parents[1] / "vendor"
 if str(_VENDOR_DIR) not in sys.path:
@@ -55,7 +60,9 @@ from wechat_context_exporter.jobs import (  # noqa: E402
 )
 from wechat_context_exporter.jobs.models import (  # noqa: E402
     JOB_SCHEMA_VERSION,
+    JobState,
     as_utc,
+    parse_utc,
 )
 from wechat_context_exporter.scenes import (  # noqa: E402
     BUILTIN_BY_ID,
@@ -73,6 +80,11 @@ _DEFAULT_OBSIDIAN_FOLDER = "微信记忆"
 _DEFAULT_OBSIDIAN_ATTACHMENTS = "_附件"
 _MAX_LIST_LIMIT = 500
 _MAX_ERROR_LENGTH = 200
+_MAX_PRUNE_METADATA_BYTES = 4 * 1024 * 1024
+_PRUNE_SNAPSHOT_VERSION = 1
+_PRUNE_BUCKETS = ("Ready", "Failed")
+# Do not use FINISHED_STATUSES: FAILED is recoverable, not disposable.
+_PRUNABLE_STATUSES = frozenset({JobStatus.DELIVERED, JobStatus.COPIED, JobStatus.EXPIRED})
 
 _JOB_ID_PATTERN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$")
 _SCENE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
@@ -527,6 +539,263 @@ def _job_summary(record: JobRecord, *, include_previews: bool = False) -> dict[s
     return summary
 
 
+class _PruneProtected(Exception):
+    """A fixed reason code; never includes filenames or exception text."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+
+def _prune_cutoff(days: int) -> datetime:
+    if isinstance(days, bool) or not isinstance(days, int) or days < 1:
+        raise TaskError("INVALID_ARGUMENT", _INVALID_ARGUMENT_MESSAGE)
+    try:
+        # Use exactly the precision sent in the snapshot, including at execution.
+        return parse_utc(format_utc(utc_now() - timedelta(days=days)))
+    except (OverflowError, ValueError):
+        raise TaskError("INVALID_ARGUMENT", _INVALID_ARGUMENT_MESSAGE) from None
+
+
+def _prune_stat(path: Path, protection: ProtectedTree | None = None) -> os.stat_result:
+    """Preview checks paths; final execution checks retained, protected handles."""
+    if protection is not None:
+        return protection.stat(path)
+    try:
+        info = path.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & 0x400  # FILE_ATTRIBUTE_REPARSE_POINT
+            or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
+            or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)
+            or path.resolve(strict=True) != path
+        ):
+            raise _PruneProtected("unsafe_path")
+        return info
+    except (OSError, RuntimeError, ValueError):
+        raise _PruneProtected("unreadable") from None
+
+
+def _prune_stat_key(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+        info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _prune_file_digest(
+    path: Path, before: os.stat_result, protection: ProtectedTree | None = None,
+) -> str:
+    """Hash contents; execution retains deny-write handles until deletion ends."""
+    digest = hashlib.sha256()
+    key = _prune_stat_key(before)
+    with protection.open_file(path) if protection is not None else path.open("rb") as handle:
+        # A link/path replacement between lstat and open must not cause reads
+        # from the replacement. Check the opened handle before reading bytes.
+        if _prune_stat_key(os.fstat(handle.fileno())) != key:
+            raise _PruneProtected("changed")
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if _prune_stat_key(os.fstat(handle.fileno())) != key:
+            raise _PruneProtected("changed")
+    return digest.hexdigest()
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("non-finite JSON constant")
+
+
+def _validate_prune_metadata(manifest: dict, state: dict, job_id: str) -> None:
+    """Validate v1 JSON types *before* the vendored reader can coerce/default.
+
+    Viewing old records is deliberately tolerant; permanent deletion is not.
+    Optional v1 blocks/fields may be absent, but a supplied value must obey its
+    contract. Unknown extra fields remain forward-compatible within v1.
+    """
+    def require(condition: bool) -> None:
+        if not condition:
+            raise _PruneProtected("unreadable_metadata")
+
+    def text(value: Any, *, nonempty: bool = False) -> None:
+        require(type(value) is str and (not nonempty or bool(value.strip())))
+
+    def count(value: Any) -> None:
+        require(type(value) is int and value >= 0)
+
+    def optional_text(payload: dict, name: str, *, nullable: bool = True) -> None:
+        if name in payload and (payload[name] is not None or not nullable):
+            text(payload[name])
+
+    def timestamp(value: Any) -> None:
+        text(value, nonempty=True)
+        parse_utc(value)  # Includes UTC normalization; the read boundary catches overflow.
+
+    def block(payload: dict, name: str, *, required: bool = False) -> dict:
+        value = payload[name] if required else payload.get(name, {})
+        require(type(value) is dict)
+        return value
+
+    text(manifest.get("job_id"), nonempty=True)
+    text(state.get("job_id"), nonempty=True)
+    require(manifest["job_id"] == job_id and state["job_id"] == job_id)
+    timestamp(manifest.get("created_at"))
+    timestamp(state.get("updated_at"))
+    text(state.get("status"), nonempty=True)
+    count(manifest.get("message_count"))
+    count(state.get("attempts"))
+    source = block(manifest, "source", required=True)
+    text(source.get("kind"), nonempty=True)
+    optional_text(source, "label", nullable=False)
+    optional_text(source, "wechat_version")
+    conversation = block(manifest, "conversation", required=True)
+    for name in ("id", "name"):
+        text(conversation.get(name), nonempty=True)
+    window = block(manifest, "window")
+    for name in ("start", "end"):
+        if window.get(name) is not None:
+            timestamp(window[name])
+    optional_text(window, "query")
+    scene = block(manifest, "scene")
+    for name in ("id", "name"):
+        optional_text(scene, name)
+    reference = block(manifest, "reference")
+    for name in ("first", "last"):
+        value = reference.get(name)
+        if value is not None:
+            require(type(value) is dict)
+            text(value.get("id"), nonempty=True)
+            timestamp(value.get("timestamp"))
+            optional_text(value, "sender", nullable=False)
+            optional_text(value, "preview", nullable=False)
+    artifacts = manifest.get("artifacts")
+    require(type(artifacts) is list)
+    for artifact in artifacts:
+        require(type(artifact) is dict)
+        for name in ("name", "sha256"):
+            text(artifact.get(name), nonempty=True)
+        optional_text(artifact, "kind", nullable=False)
+        count(artifact.get("size"))
+    notes = manifest.get("notes", [])
+    require(type(notes) is list)
+    for note in notes:
+        text(note)
+    for name in ("target", "destination", "error"):
+        optional_text(state, name)
+    optional_text(state, "detail", nullable=False)
+
+
+def _prune_metadata(
+    directory: Path, protection: ProtectedTree | None = None,
+) -> tuple[JobRecord, bytes, bytes]:
+    """Strict reading for deletion, without JobStore's tolerant/default state."""
+    raw: list[bytes] = []
+    payloads: list[dict[str, Any]] = []
+    try:
+        for name in ("manifest.json", "state.json"):
+            path = directory / name
+            before = _prune_stat(path, protection)
+            if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_PRUNE_METADATA_BYTES:
+                raise _PruneProtected("unreadable_metadata")
+            with protection.open_file(path) if protection is not None else path.open("rb") as handle:
+                if _prune_stat_key(os.fstat(handle.fileno())) != _prune_stat_key(before):
+                    raise _PruneProtected("changed")
+                data = handle.read(_MAX_PRUNE_METADATA_BYTES + 1)
+                if _prune_stat_key(os.fstat(handle.fileno())) != _prune_stat_key(before):
+                    raise _PruneProtected("changed")
+            if len(data) > _MAX_PRUNE_METADATA_BYTES:
+                raise _PruneProtected("unreadable_metadata")
+            if _prune_stat_key(before) != _prune_stat_key(_prune_stat(path, protection)):
+                raise _PruneProtected("changed")
+            payload = json.loads(
+                data.decode("utf-8"),
+                object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_json_constant,
+            )
+            if not isinstance(payload, dict):
+                raise _PruneProtected("unreadable_metadata")
+            raw.append(data)
+            payloads.append(payload)
+        manifest, state = payloads
+        # The vendored manifest reader accepts future versions and a missing
+        # version; that is appropriate for viewing, never for deletion.
+        version = manifest.get("schema_version")
+        state_version = state.get("schema_version", JOB_SCHEMA_VERSION)
+        if (
+            type(version) is not int or version != JOB_SCHEMA_VERSION
+            or type(state_version) is not int or state_version != JOB_SCHEMA_VERSION
+        ):
+            raise _PruneProtected("unsupported_schema")
+        _validate_prune_metadata(manifest, state, directory.name)
+        record = JobRecord(
+            manifest=JobManifest.from_dict(manifest),
+            state=JobState.from_dict(state),
+            directory=directory,
+        )
+        return record, raw[0], raw[1]
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, RecursionError, OverflowError):
+        raise _PruneProtected("unreadable_metadata") from None
+
+
+def _prune_tree(
+    directory: Path, cutoff: datetime, protection: ProtectedTree | None = None,
+) -> tuple[str, int]:
+    """Check the *whole* structure/recency cheaply before hashing any artifact.
+
+    Execution acquires and retains every directory/file handle in this first
+    pass, so no file already hashed can be rewritten while hashing later files.
+    The preview is read-only/best-effort, never a substitute for this protected
+    execution check. Empty dirs, attachments, prompt and metadata all matter.
+    """
+    pending = [directory]
+    observed: list[tuple[Path, os.stat_result]] = []
+    digest = hashlib.sha256()
+    artifact_bytes = 0
+    # Avoid datetime.timestamp(), which can raise OSError for year-0001 snapshot
+    # cutoffs on Windows. Compute signed epoch nanoseconds using pure arithmetic.
+    delta = cutoff - datetime(1970, 1, 1, tzinfo=cutoff.tzinfo)
+    cutoff_ns = ((delta.days * 86_400 + delta.seconds) * 1_000_000_000
+                 + delta.microseconds * 1_000)
+    try:
+        while pending:
+            path = pending.pop()
+            info = _prune_stat(path, protection)
+            if info.st_mtime_ns > cutoff_ns:
+                raise _PruneProtected("recent_write")
+            observed.append((path, info))
+            if stat.S_ISDIR(info.st_mode):
+                if protection is not None:
+                    names = protection.names(path)
+                else:
+                    with os.scandir(path) as entries:
+                        names = sorted(entry.name for entry in entries)
+                pending.extend(path / name for name in reversed(names))
+        for path, info in observed:
+            relative = path.relative_to(directory)
+            digest.update(json.dumps(
+                [relative.as_posix(), _prune_stat_key(info)], ensure_ascii=True,
+            ).encode("ascii"))
+            if stat.S_ISREG(info.st_mode):
+                digest.update(_prune_file_digest(path, info, protection).encode("ascii"))
+                if relative.parts and Path(relative.parts[0]) == Path("files"):
+                    artifact_bytes += info.st_size
+        for path, info in observed:
+            if _prune_stat_key(_prune_stat(path, protection)) != _prune_stat_key(info):
+                raise _PruneProtected("changed")
+            if protection is not None and stat.S_ISDIR(info.st_mode):
+                protection.names(path)  # A new child is never silently adopted.
+    except (OSError, RuntimeError, ValueError):
+        raise _PruneProtected("unreadable") from None
+    return digest.hexdigest(), artifact_bytes
+
+
 @dataclass(frozen=True)
 class TaskService:
     """Task history, scene storage, and file delivery rooted at private paths."""
@@ -880,15 +1149,106 @@ class TaskService:
                 continue
         return {"recovered": safe_ids}
 
-    def prune_jobs(self, days: int) -> dict:
-        if isinstance(days, bool) or not isinstance(days, int) or days < 1:
+    def preview_prune_jobs(self, days: int) -> dict:
+        """Read-only maintenance preview, including a JSON-roundtrippable snapshot.
+
+        knownArtifactBytes counts logical file lengths under candidates' files/
+        only (including attachments), not external delivery copies or reclaimed
+        disk allocation. unknownSizeCount counts skipped/unmeasured jobs, not
+        additional candidates; their sizes are null, never zero. Nothing creates
+        or rewrites even a missing root.
+        """
+        cutoff = _prune_cutoff(days)
+        candidates: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        jobs: list[dict[str, str]] = []
+        for job_id, paths in self._prune_entries().items():
+            try:
+                if len(paths) != 1:
+                    raise _PruneProtected("duplicate_id")
+                candidate, fingerprint = self._prune_candidate(paths[0], cutoff)
+            except _PruneProtected as exc:
+                skipped.append({"jobId": job_id, "reason": exc.reason, "artifactBytes": None})
+                continue
+            candidates.append(candidate)
+            jobs.append({"jobId": job_id, "fingerprint": fingerprint})
+        return {
+            "dryRun": True,
+            "days": days,
+            "cutoff": format_utc(cutoff),
+            "candidateCount": len(candidates),
+            "knownArtifactBytes": sum(item["artifactBytes"] for item in candidates),
+            "unknownSizeCount": len(skipped),
+            "candidates": candidates,
+            "skipped": skipped,
+            "snapshot": {
+                "version": _PRUNE_SNAPSHOT_VERSION,
+                "days": days,
+                "cutoff": format_utc(cutoff),
+                "jobs": jobs,
+            },
+        }
+
+    def prune_jobs(
+        self,
+        days: int,
+        *,
+        dry_run: bool = False,
+        snapshot: dict | None = None,
+    ) -> dict:
+        """Explicit manual deletion; never called automatically by this service.
+
+        UI callers should confirm preview_prune_jobs(), then pass its snapshot
+        here. snapshot.jobs may be narrowed to the explicitly selected IDs; it
+        never authorizes deleting newly discovered jobs. Every selected job is
+        re-read and must still match its metadata/tree fingerprint and cutoff.
+
+        The legacy prune_jobs(days) call remains supported: it takes a fresh
+        preview and executes only that snapshot, using the same protections.
+        Like the original prune, deletion is permanent, not a recycle-bin API;
+        there is no fallback from failed recycling and no ignore_errors path.
+        """
+        if not isinstance(dry_run, bool):
             raise TaskError("INVALID_ARGUMENT", _INVALID_ARGUMENT_MESSAGE)
-        store = self._job_store()
-        try:
-            removed = store.prune(days, keep_unfinished=True)
-        except Exception:
-            raise TaskError("JOB_STORE_UNAVAILABLE", _STORE_UNAVAILABLE_MESSAGE) from None
-        return {"removed": [job_id for job_id in removed if _JOB_ID_PATTERN.match(job_id)]}
+        if dry_run:
+            if snapshot is not None:
+                raise TaskError("INVALID_ARGUMENT", _INVALID_ARGUMENT_MESSAGE)
+            return self.preview_prune_jobs(days)
+        if snapshot is None:
+            snapshot = self.preview_prune_jobs(days)["snapshot"]
+        cutoff, selected = self._prune_selection(snapshot, days, _prune_cutoff(days))
+        entries = self._prune_entries()
+        removed: list[str] = []
+        skipped: list[dict[str, str]] = []
+        for job_id, fingerprint in selected:
+            paths = entries.get(job_id, [])
+            try:
+                if not paths:
+                    raise _PruneProtected("not_found")
+                if len(paths) != 1:
+                    raise _PruneProtected("duplicate_id")
+                # Acquire before final revalidation, and retain all ancestors /
+                # descendants through deletion. Never pass a mutable path to a
+                # recursive path-based deleter, even after resolve/lstat/hash.
+                with ProtectedTree(paths[0]) as protection:
+                    _, actual = self._prune_candidate(paths[0], cutoff, protection)
+                    if actual != fingerprint:
+                        raise _PruneProtected("changed")
+                    protection.delete()
+            except (_PruneProtected, SafeDeleteError) as exc:
+                skipped.append({"jobId": job_id, "reason": exc.reason})
+                continue
+            except OSError:
+                skipped.append({"jobId": job_id, "reason": "delete_failed"})
+                continue
+            removed.append(job_id)
+        return {
+            "dryRun": False,
+            "days": days,
+            "cutoff": format_utc(cutoff),
+            "removed": removed,
+            "skipped": skipped,
+        }
 
     def get_job_artifact_path(self, job_id: str, name: str) -> Path:
         record = self._load_record(job_id)
@@ -921,6 +1281,114 @@ class TaskService:
         return record.directory
 
     # -- internals ------------------------------------------------------
+
+    @staticmethod
+    def _prune_selection(
+        snapshot: dict, days: int, current_cutoff: datetime,
+    ) -> tuple[datetime, list[tuple[str, str]]]:
+        try:
+            if (
+                not isinstance(snapshot, dict)
+                or type(snapshot.get("version")) is not int
+                or snapshot["version"] != _PRUNE_SNAPSHOT_VERSION
+                or type(snapshot.get("days")) is not int
+                or snapshot["days"] != days
+                or not isinstance(snapshot.get("cutoff"), str)
+                or not isinstance(snapshot.get("jobs"), list)
+            ):
+                raise ValueError
+            cutoff = parse_utc(snapshot["cutoff"])
+            if format_utc(cutoff) != snapshot["cutoff"] or cutoff > current_cutoff:
+                raise ValueError
+            selected: list[tuple[str, str]] = []
+            seen: set[str] = set()
+            for item in snapshot["jobs"]:
+                if not isinstance(item, dict):
+                    raise ValueError
+                job_id, fingerprint = item.get("jobId"), item.get("fingerprint")
+                if (
+                    not isinstance(job_id, str) or not _JOB_ID_PATTERN.fullmatch(job_id)
+                    or job_id in seen
+                    or not isinstance(fingerprint, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+                ):
+                    raise ValueError
+                seen.add(job_id)
+                selected.append((job_id, fingerprint))
+            return cutoff, selected
+        except (ValueError, TypeError, OverflowError):
+            raise TaskError("INVALID_ARGUMENT", _INVALID_ARGUMENT_MESSAGE) from None
+
+    def _prune_entries(self) -> dict[str, list[Path]]:
+        """Enumerate only owned buckets; never instantiate a writable store."""
+        result: dict[str, list[Path]] = {}
+        try:
+            try:
+                self.jobs_root.lstat()
+            except FileNotFoundError:
+                return result
+            if not stat.S_ISDIR(_prune_stat(self.jobs_root).st_mode):
+                raise _PruneProtected("unsafe_path")
+            # Staging is never deletable, but a duplicate ID there protects the
+            # corresponding Ready/Failed entry as well.
+            for bucket in (*_PRUNE_BUCKETS, ".staging"):
+                base = self.jobs_root / bucket
+                try:
+                    base.lstat()
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(_prune_stat(base).st_mode):
+                    raise _PruneProtected("unsafe_path")
+                with os.scandir(base) as entries:
+                    names = sorted(entry.name for entry in entries)
+                for name in names:
+                    if _JOB_ID_PATTERN.fullmatch(name):
+                        result.setdefault(name, []).append(base / name)
+            return result
+        except _PruneProtected:
+            raise TaskError("JOB_PATH_UNSAFE", _JOB_PATH_UNSAFE_MESSAGE) from None
+        except (OSError, RuntimeError, ValueError):
+            raise TaskError("JOB_STORE_UNAVAILABLE", _STORE_UNAVAILABLE_MESSAGE) from None
+
+    def _prune_candidate(
+        self, directory: Path, cutoff: datetime, protection: ProtectedTree | None = None,
+    ) -> tuple[dict, str]:
+        if directory.parent.name not in _PRUNE_BUCKETS:
+            raise _PruneProtected("unfinished")
+        root_info = _prune_stat(self.jobs_root, protection)
+        base_info = _prune_stat(directory.parent, protection)
+        if not stat.S_ISDIR(_prune_stat(directory, protection).st_mode):
+            raise _PruneProtected("unsafe_path")
+        record, manifest_bytes, state_bytes = _prune_metadata(directory, protection)
+        if not self._owns_record(record, directory.name):
+            raise _PruneProtected("unsafe_path")
+        if record.state.status not in _PRUNABLE_STATUSES:
+            raise _PruneProtected("unfinished")
+        if record.state.updated_at > cutoff or record.manifest.created_at > cutoff:
+            raise _PruneProtected("not_old")
+        tree_fingerprint, artifact_bytes = _prune_tree(directory, cutoff, protection)
+        _, manifest_after, state_after = _prune_metadata(directory, protection)
+        if manifest_after != manifest_bytes or state_after != state_bytes:
+            raise _PruneProtected("changed")
+        # Bucket/root mtime changes from unrelated jobs must not block cleanup,
+        # but replacing either directory (or inserting a link) must block it.
+        for path, before in ((self.jobs_root, root_info), (directory.parent, base_info)):
+            after = _prune_stat(path, protection)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise _PruneProtected("changed")
+        digest = hashlib.sha256()
+        for value in (
+            directory.relative_to(self.jobs_root).as_posix().encode("utf-8"),
+            manifest_bytes, state_bytes, tree_fingerprint.encode("ascii"),
+        ):
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+        return {
+            "jobId": record.job_id,
+            "status": record.state.status.value,
+            "updatedAt": format_utc(record.state.updated_at),
+            "artifactBytes": artifact_bytes,
+        }, digest.hexdigest()
 
     def _job_store(self) -> _QuietJobStore:
         try:

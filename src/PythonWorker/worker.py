@@ -15,9 +15,12 @@ import argparse
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
+import time as _time
 import traceback
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -28,6 +31,9 @@ MAX_REQUEST_BYTES = 1024 * 1024
 MAX_PAGE_SIZE = 100
 MAX_EXPORT_MESSAGES = 200_000
 DEFAULT_PAGE_SIZE = 50
+_MAX_PRUNE_PREVIEWS = 3
+_PRUNE_PREVIEW_TTL_SECONDS = 600
+_MAX_PRUNE_REASON_BUCKETS = 12
 DEMO_TIMEZONE = timezone(timedelta(hours=8))
 TIMEZONE_LABEL = "UTC+08:00"
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -47,6 +53,11 @@ from wechat_context_exporter.models import (  # noqa: E402
     MessageType,
 )
 from wechat_context_exporter.text_exporters import export_json, export_markdown  # noqa: E402
+from wechat_memory.offline_import import (  # noqa: E402
+    ImportedJson,
+    OfflineImportError,
+    load_json_file,
+)
 
 
 class WorkerError(Exception):
@@ -76,6 +87,13 @@ class DemoConversation:
     messages: tuple[DemoMessage, ...]
 
 
+@dataclass(frozen=True)
+class _PrunePreviewToken:
+    days: int
+    snapshot: dict[str, Any]
+    expires_at: float
+
+
 class Context:
     """Per-worker state plus the current request's progress channel."""
 
@@ -86,8 +104,17 @@ class Context:
         self.scenes_file = scenes_file
         self.model_root = model_root
         self.wechat = None  # WeChat4Source | None
+        # A successful import is a complete immutable snapshot.  The selected
+        # file is not consulted again, so later edits/removal cannot create a
+        # half-updated active source and message content cannot become a path.
+        self.offline: ImportedJson | None = None
+        self.offline_path: str | None = None
         self.progress: Callable[[int, int, str], None] | None = None
         self.request_id: str = ""
+        # Confirmation snapshots are deliberately process-local, bounded, and
+        # short-lived. They never cross the JSON-lines boundary or reach logs.
+        self.prune_previews: OrderedDict[str, _PrunePreviewToken] = OrderedDict()
+        self.expired_prune_tokens: OrderedDict[str, None] = OrderedDict()
 
     def emit_progress(self, current: int, total: int, label: str) -> None:
         if self.progress is not None:
@@ -206,7 +233,9 @@ def _filter_query(items: list[Any], query: str | None) -> list[Any]:
     needle = query.casefold()
     result = []
     for item in items:
-        kind = item.kind if isinstance(item, DemoMessage) else item.type.value
+        # Live models use an enum; demo and offline JSON models both expose
+        # the already-validated string kind instead of a Message.type member.
+        kind = item.type.value if isinstance(item, Message) else item.kind
         if (needle in item.sender.casefold() or needle in item.content.casefold()
                 or needle in kind.casefold()):
             result.append(item)
@@ -245,7 +274,7 @@ def _bool_arg(payload: dict[str, Any], key: str, default: bool = False) -> bool:
 
 def _source_kind(payload: dict[str, Any]) -> str:
     source = payload.get("source", "demo")
-    if source not in {"demo", "wechat4"}:
+    if source not in {"demo", "wechat4", "offline"}:
         raise WorkerError("SOURCE_NOT_FOUND", "当前版本不支持此数据源。")
     return source
 
@@ -254,6 +283,12 @@ def _checked_source(payload: dict[str, Any], context: Context) -> str:
     if _source_kind(payload) != "demo":
         raise WorkerError("SOURCE_NOT_FOUND", "此命令只适用于演示数据源。")
     return context.demo_path
+
+
+def _offline_conversations(context: Context):
+    if context.offline is None:
+        raise WorkerError("SOURCE_NOT_FOUND", "尚未导入离线 JSON。")
+    return context.offline.conversations
 
 
 def _find_demo_conversation(conversations: list[DemoConversation], payload: dict[str, Any]) -> DemoConversation:
@@ -268,13 +303,30 @@ def _find_demo_conversation(conversations: list[DemoConversation], payload: dict
 
 
 def _demo_message_json(item: DemoMessage) -> dict[str, Any]:
-    return {
+    result = {
         "id": item.id,
         "sender": item.sender,
         "timestamp": item.timestamp.isoformat(timespec="seconds"),
         "content": item.content,
         "kind": item.kind,
     }
+    if getattr(item, "is_outgoing", False):
+        result["isOutgoing"] = True
+    return result
+
+
+def _offline_message_json(item: Any) -> dict[str, Any]:
+    """Expose an imported snapshot without exposing or opening media paths."""
+    result = _demo_message_json(item)
+    if item.kind == "image":
+        result["content"] = "[图片]"
+    if item.duration_ms is not None:
+        result["durationMs"] = item.duration_ms
+    if item.transcript:
+        result["transcript"] = item.transcript
+    if item.reply_to:
+        result["replyTo"] = item.reply_to
+    return result
 
 
 def _real_message_json(item: Message) -> dict[str, Any]:
@@ -361,7 +413,7 @@ def handle_hello(payload: dict[str, Any], context: Context) -> dict[str, Any]:
     return {
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": [
-            "demo", "wechat4", "accounts", "message_search", "message_pagination",
+            "demo", "wechat4", "offline_json", "accounts", "message_search", "message_pagination",
             "markdown_export", "json_export", "pdf_export", "png_pages",
             "image_recovery", "voice_transcribe", "tasks", "scenes", "delivery",
             "progress_events",
@@ -430,6 +482,34 @@ def handle_disconnect(payload: dict[str, Any], context: Context) -> dict[str, An
     return {"connected": False}
 
 
+def handle_import_json(payload: dict[str, Any], context: Context) -> dict[str, Any]:
+    raw_path = payload.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise WorkerError("INVALID_ARGUMENT", "path 必须是非空字符串。")
+    # Parse and validate everything before changing either the active source or
+    # the live WeChat source.  A failed candidate therefore leaves old data
+    # and exportability untouched.
+    try:
+        candidate = load_json_file(raw_path)
+    except OfflineImportError as error:
+        raise WorkerError(error.code, error.message) from None
+
+    if context.wechat is not None:
+        try:
+            context.wechat.close()
+        except Exception:
+            raise WorkerError("SOURCE_SWITCH_FAILED", "无法切换到离线数据源，原数据仍保持不变。") from None
+    context.wechat = None
+    context.offline = candidate
+    context.offline_path = raw_path
+    return {
+        "source": "offline",
+        "schema": candidate.schema,
+        "conversationCount": len(candidate.conversations),
+        "messageCount": candidate.message_count,
+    }
+
+
 def handle_list_conversations(payload: dict[str, Any], context: Context) -> dict[str, Any]:
     source_name = _source_kind(payload)
     query = payload.get("query")
@@ -437,6 +517,17 @@ def handle_list_conversations(payload: dict[str, Any], context: Context) -> dict
         raise WorkerError("INVALID_ARGUMENT", "query 必须是字符串。")
     if source_name == "demo":
         conversations = load_demo(context.demo_path)
+        needle = (query or "").casefold()
+        return {
+            "items": [
+                {"id": item.id, "title": item.title, "messageCount": len(item.messages),
+                 "kind": item.kind, "countKnown": True}
+                for item in conversations
+                if not needle or needle in item.title.casefold()
+            ]
+        }
+    if source_name == "offline":
+        conversations = _offline_conversations(context)
         needle = (query or "").casefold()
         return {
             "items": [
@@ -482,6 +573,18 @@ def handle_get_messages(payload: dict[str, Any], context: Context) -> dict[str, 
             "total": len(selected),
             "nextOffset": next_offset if next_offset < len(selected) else None,
         }
+    if source_name == "offline":
+        conversation = _find_demo_conversation(_offline_conversations(context), payload)
+        selected = _filter_query(filter_messages(conversation, start, end), query)
+        if order == "desc":
+            selected = list(reversed(selected))
+        page = selected[offset:offset + limit]
+        next_offset = offset + len(page)
+        return {
+            "items": [_offline_message_json(item) for item in page],
+            "total": len(selected),
+            "nextOffset": next_offset if next_offset < len(selected) else None,
+        }
     conversation, page = _real_messages(
         context, payload.get("conversationId", ""), start, end, query, offset, limit, order
     )
@@ -506,30 +609,40 @@ def _output_path(payload: dict[str, Any], suffix: str) -> Path:
     return path
 
 
-def _to_export_message(conversation: DemoConversation, item: DemoMessage) -> Message:
+def _to_export_message(
+    conversation: DemoConversation, item: DemoMessage, *, safe_media: bool = False
+) -> Message:
     kind = MessageType(item.kind)
-    # Demo media contents are placeholders unless they point at a readable
-    # local file. Only then may an image stay an image: this lets deterministic
-    # tests (and a user-edited demo file) exercise real media export without
-    # ever inventing links or transcripts for placeholder text.
+    content = item.content
+    # Offline JSON is untrusted metadata.  Never test/open a path from its
+    # content; media remains an explicit placeholder during every export.
     if kind is MessageType.IMAGE:
-        try:
-            export_kind = kind if Path(item.content).is_file() else MessageType.SYSTEM
-        except (OSError, ValueError):
+        if safe_media:
             export_kind = MessageType.SYSTEM
+            content = "[图片]"
+        else:
+            try:
+                export_kind = kind if Path(item.content).is_file() else MessageType.SYSTEM
+            except (OSError, ValueError):
+                export_kind = MessageType.SYSTEM
+    elif kind is MessageType.FILE:
+        export_kind = MessageType.SYSTEM
+        content = f"[文件] {item.content}"
+    elif kind is MessageType.VOICE:
+        export_kind = kind if safe_media else MessageType.SYSTEM
     else:
-        export_kind = (
-            kind
-            if kind in (MessageType.TEXT, MessageType.SYSTEM)
-            else MessageType.SYSTEM
-        )
+        export_kind = kind if kind in (MessageType.TEXT, MessageType.SYSTEM) else MessageType.SYSTEM
     return Message(
         id=item.id,
         conversation_id=conversation.id,
         sender=item.sender,
         timestamp=item.timestamp,
         type=export_kind,
-        content=item.content,
+        content=content,
+        is_outgoing=getattr(item, "is_outgoing", False),
+        reply_to=getattr(item, "reply_to", None),
+        duration_ms=getattr(item, "duration_ms", None),
+        transcript=getattr(item, "transcript", None),
     )
 
 
@@ -648,6 +761,8 @@ def handle_export_markdown(payload: dict[str, Any], context: Context) -> dict[st
         selected = _filter_query(filter_messages(conversation, start, end), query)
         _write_atomic(conversation, selected, output, overwrite)
         return {"path": str(output), "messageCount": len(selected), "bytes": output.stat().st_size}
+    if source_name == "offline":
+        return _export_with_module(payload, context, "markdown")
     conversation, messages = _real_export_models(context, payload)
     _write_models_atomic(conversation, messages, output, overwrite)
     return {"path": str(output), "messageCount": len(messages), "bytes": output.stat().st_size}
@@ -666,6 +781,11 @@ def _models_for_export(payload: dict[str, Any], context: Context) -> tuple[Conve
         selected = _filter_query(filter_messages(conversation, start, end), query)
         model = Conversation(conversation.id, conversation.title, ConversationKind(conversation.kind))
         return model, [_to_export_message(conversation, item) for item in selected]
+    if source_name == "offline":
+        conversation = _find_demo_conversation(_offline_conversations(context), payload)
+        selected = _filter_query(filter_messages(conversation, start, end), query)
+        model = Conversation(conversation.id, conversation.title, ConversationKind(conversation.kind))
+        return model, [_to_export_message(conversation, item, safe_media=True) for item in selected]
     return _real_export_models(context, payload)
 
 
@@ -688,7 +808,11 @@ def _export_with_module(payload: dict[str, Any], context: Context, fmt: str) -> 
         result = export_conversation(
             conversation, messages, output, fmt, overwrite=overwrite,
             pages_dir=pages_dir,
-            materialize_media=_bool_arg(payload, "materializeMedia", True),
+            # Offline models already replaced image paths with placeholders;
+            # their existing voice transcripts are text, not recovered media.
+            materialize_media=(
+                _bool_arg(payload, "materializeMedia", True) or _source_kind(payload) == "offline"
+            ),
         )
     except ExportError as error:
         raise WorkerError(error.code, error.message) from None
@@ -817,7 +941,11 @@ def _task_export_writer(
                     fmt,
                     overwrite=False,
                     pages_dir=pages_dir,
-                    materialize_media=_bool_arg(payload, "materializeMedia", True),
+                    # Match direct offline exports: safe models contain no
+                    # recoverable paths, but keep their existing transcripts.
+                    materialize_media=(
+                        _bool_arg(payload, "materializeMedia", True) or _source_kind(payload) == "offline"
+                    ),
                 )
             except ExportError as error:
                 raise WorkerError(error.code, error.message) from None
@@ -859,8 +987,12 @@ def handle_export_job(payload: dict[str, Any], context: Context) -> dict[str, An
             start=start_dt,
             end=end_dt,
             query=payload.get("query"),
-            source_kind="wechat4" if _source_kind(payload) == "wechat4" else "demo",
-            source_label="微信 4.x 只读" if _source_kind(payload) == "wechat4" else "虚构演示数据",
+            source_kind=_source_kind(payload),
+            source_label=(
+                "微信 4.x 只读" if _source_kind(payload) == "wechat4" else
+                "离线 JSON · 只读" if _source_kind(payload) == "offline" else
+                "虚构演示数据"
+            ),
             wechat_version="4.x" if _source_kind(payload) == "wechat4" else None,
             export_fn=_task_export_writer(context, payload, conversation, messages),
             prompt=payload.get("prompt") if isinstance(payload.get("prompt"), str) else None,
@@ -925,11 +1057,171 @@ def handle_recover_jobs(payload: dict[str, Any], context: Context) -> dict[str, 
 
 
 def handle_prune_jobs(payload: dict[str, Any], context: Context) -> dict[str, Any]:
+    # Legacy command retained for old clients. The native UI must use the
+    # preview_prune_jobs / confirm_prune_jobs token path below.
     service, TaskError = _task_service(context)
     try:
         return service.prune_jobs(_int_arg(payload, "days", 30, 1, 3650))
     except TaskError as error:
         raise _task_error(error) from None
+
+
+def _required_prune_days(payload: dict[str, Any]) -> int:
+    if "days" not in payload:
+        raise WorkerError("INVALID_ARGUMENT", "清理保留天数必须明确提供。")
+    return _int_arg(payload, "days", 0, 1, 3650)
+
+
+def _prune_reason_counts(items: list[Any]) -> dict[str, int]:
+    """Summarize fixed backend reason codes without returning an unbounded list."""
+    counts: dict[str, int] = {}
+    overflow_key = "other"
+    for item in items:
+        reason = item.get("reason") if isinstance(item, dict) else None
+        if not isinstance(reason, str) or not reason or len(reason) > 64:
+            reason = "unknown"
+        if reason in counts:
+            counts[reason] += 1
+        elif len(counts) < _MAX_PRUNE_REASON_BUCKETS - 1 and reason != overflow_key:
+            counts[reason] = 1
+        else:
+            counts[overflow_key] = counts.get(overflow_key, 0) + 1
+    return counts
+
+
+def _remember_expired_prune_token(context: Context, token: str) -> None:
+    context.expired_prune_tokens[token] = None
+    context.expired_prune_tokens.move_to_end(token)
+    while len(context.expired_prune_tokens) > 8:
+        context.expired_prune_tokens.popitem(last=False)
+
+
+def _purge_expired_prune_tokens(context: Context, now: float) -> None:
+    for token, entry in list(context.prune_previews.items()):
+        if entry.expires_at <= now:
+            del context.prune_previews[token]
+            _remember_expired_prune_token(context, token)
+
+
+def _cache_prune_snapshot(context: Context, days: int, snapshot: dict[str, Any]) -> str:
+    now = _time.monotonic()
+    _purge_expired_prune_tokens(context, now)
+    while len(context.prune_previews) >= _MAX_PRUNE_PREVIEWS:
+        context.prune_previews.popitem(last=False)
+    token = secrets.token_urlsafe(32)
+    while token in context.prune_previews or token in context.expired_prune_tokens:
+        token = secrets.token_urlsafe(32)
+    context.prune_previews[token] = _PrunePreviewToken(
+        days=days,
+        snapshot=snapshot,
+        expires_at=now + _PRUNE_PREVIEW_TTL_SECONDS,
+    )
+    return token
+
+
+def _take_prune_snapshot(context: Context, days: int, payload: dict[str, Any]) -> dict[str, Any]:
+    token = payload.get("previewToken")
+    if not isinstance(token, str) or not token.strip() or len(token) > 128:
+        raise WorkerError("PRUNE_PREVIEW_REQUIRED", "请先预览清理范围，再确认执行。")
+    now = _time.monotonic()
+    _purge_expired_prune_tokens(context, now)
+    entry = context.prune_previews.get(token)
+    if entry is None:
+        if token in context.expired_prune_tokens:
+            context.expired_prune_tokens.pop(token, None)
+            raise WorkerError("PRUNE_PREVIEW_EXPIRED", "清理预览已过期，请重新预览。")
+        raise WorkerError("PRUNE_PREVIEW_UNKNOWN", "清理预览不存在，请重新预览。")
+    if entry.expires_at <= now:
+        del context.prune_previews[token]
+        _remember_expired_prune_token(context, token)
+        context.expired_prune_tokens.pop(token, None)
+        raise WorkerError("PRUNE_PREVIEW_EXPIRED", "清理预览已过期，请重新预览。")
+    if entry.days != days:
+        raise WorkerError("PRUNE_PREVIEW_MISMATCH", "预览与保留天数不一致，请重新预览。")
+    # Consume before any deletion starts. A retry after an uncertain pipe loss
+    # must obtain a new preview rather than replaying the same authorization.
+    del context.prune_previews[token]
+    return entry.snapshot
+
+
+def handle_preview_prune_jobs(payload: dict[str, Any], context: Context) -> dict[str, Any]:
+    days = _required_prune_days(payload)
+    service, TaskError = _task_service(context)
+    try:
+        preview = service.preview_prune_jobs(days)
+    except TaskError as error:
+        raise _task_error(error) from None
+
+    if (
+        not isinstance(preview, dict)
+        or preview.get("dryRun") is not True
+        or type(preview.get("days")) is not int
+        or preview["days"] != days
+        or not isinstance(preview.get("cutoff"), str)
+        or not isinstance(preview.get("candidates"), list)
+        or not isinstance(preview.get("skipped"), list)
+        or type(preview.get("candidateCount")) is not int
+        or preview["candidateCount"] != len(preview["candidates"])
+        or type(preview.get("knownArtifactBytes")) is not int
+        or preview["knownArtifactBytes"] < 0
+        or type(preview.get("unknownSizeCount")) is not int
+        or preview["unknownSizeCount"] != len(preview["skipped"])
+    ):
+        raise WorkerError("PROTOCOL_ERROR", "清理预览结果格式不正确。")
+
+    snapshot = preview.get("snapshot")
+    if (
+        not isinstance(snapshot, dict)
+        or type(snapshot.get("version")) is not int
+        or snapshot["version"] != 1
+        or type(snapshot.get("days")) is not int
+        or snapshot["days"] != days
+        or snapshot.get("cutoff") != preview["cutoff"]
+        or not isinstance(snapshot.get("jobs"), list)
+        or len(snapshot["jobs"]) != preview["candidateCount"]
+    ):
+        raise WorkerError("PROTOCOL_ERROR", "清理预览快照格式不正确。")
+
+    token = _cache_prune_snapshot(context, days, snapshot)
+    return {
+        "dryRun": True,
+        "days": days,
+        "cutoff": preview["cutoff"],
+        "candidateCount": preview["candidateCount"],
+        "knownArtifactBytes": preview["knownArtifactBytes"],
+        "unknownSizeCount": preview["unknownSizeCount"],
+        "skippedReasonCounts": _prune_reason_counts(preview["skipped"]),
+        "previewToken": token,
+    }
+
+
+def handle_confirm_prune_jobs(payload: dict[str, Any], context: Context) -> dict[str, Any]:
+    days = _required_prune_days(payload)
+    snapshot = _take_prune_snapshot(context, days, payload)
+    service, TaskError = _task_service(context)
+    try:
+        result = service.prune_jobs(days, snapshot=snapshot)
+    except TaskError as error:
+        raise _task_error(error) from None
+
+    if (
+        not isinstance(result, dict)
+        or result.get("dryRun") is not False
+        or type(result.get("days")) is not int
+        or result["days"] != days
+        or not isinstance(result.get("cutoff"), str)
+        or not isinstance(result.get("removed"), list)
+        or not isinstance(result.get("skipped"), list)
+    ):
+        raise WorkerError("PROTOCOL_ERROR", "清理执行结果格式不正确。")
+    return {
+        "dryRun": False,
+        "days": days,
+        "cutoff": result["cutoff"],
+        "removedCount": len(result["removed"]),
+        "skippedCount": len(result["skipped"]),
+        "skippedReasonCounts": _prune_reason_counts(result["skipped"]),
+    }
 
 
 def handle_get_job_artifact_path(payload: dict[str, Any], context: Context) -> dict[str, Any]:
@@ -1018,6 +1310,7 @@ HANDLERS = {
     "list_accounts": handle_list_accounts,
     "connect": handle_connect,
     "disconnect": handle_disconnect,
+    "import_json": handle_import_json,
     "list_conversations": handle_list_conversations,
     "get_messages": handle_get_messages,
     "export_markdown": handle_export_markdown,
@@ -1034,6 +1327,8 @@ HANDLERS = {
     "record_delivery": handle_record_delivery,
     "recover_jobs": handle_recover_jobs,
     "prune_jobs": handle_prune_jobs,
+    "preview_prune_jobs": handle_preview_prune_jobs,
+    "confirm_prune_jobs": handle_confirm_prune_jobs,
     "get_job_artifact_path": handle_get_job_artifact_path,
     "voice_status": handle_voice_status,
     "prepare_voice_model": handle_prepare_voice_model,

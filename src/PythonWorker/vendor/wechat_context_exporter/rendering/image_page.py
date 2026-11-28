@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 from ..models import Conversation, Message
 from .config import PageConfig, RenderTheme
-from .fonts import FontBook, draw_text_with_fallback
+from .fonts import FontBook, draw_text_with_fallback, single_line_metadata
 from .scaled_draw import ScaledDraw
 
 
@@ -74,7 +74,7 @@ class ImagePageRenderer:
         draw_text_with_fallback(
             draw,
             (self.config.margin_x + 112, y - 2),
-            value,
+            single_line_metadata(value),
             self.value_font,
             self.value_emoji_font,
             self.theme.ink,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -585,6 +586,19 @@ class RecoveryTests(TaskTestCase):
             json.dumps(state, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+        # Cleanup checks the entire synthetic task, not just the completion
+        # timestamp: a newly created manifest/prompt/artifact must stay protected.
+        job_dir = state_path.parent
+        manifest_path = job_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["created_at"] = "2020-01-01T00:00:00Z"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        old = datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp()
+        for base, directories, files in os.walk(job_dir, followlinks=False):
+            for name in directories + files:
+                os.utime(Path(base) / name, (old, old))
+        os.utime(job_dir, (old, old))
 
         removed = self.service.prune_jobs(1)["removed"]
         self.assertIn(job_id, removed)

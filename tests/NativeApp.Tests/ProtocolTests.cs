@@ -1,4 +1,5 @@
 using System.Text.Json;
+using WechatMemory.NativeApp.Models;
 using WechatMemory.NativeApp.Services;
 using Xunit;
 
@@ -36,6 +37,19 @@ public class ProtocolTests
     }
     [Fact]
     public void ProgressIsNotAFinalResult() => Assert.Null(Protocol.ReadResponse("{\"protocolVersion\":1,\"requestId\":\"r\",\"type\":\"progress\"}", "r"));
+
+    [Fact]
+    public void OfflineImportResultDeserializesTheV1SourceSummary()
+    {
+        const string json = "{\"source\":\"offline\",\"schema\":\"wechat-memory-json-v1\",\"conversationCount\":2,\"messageCount\":3}";
+        var result = JsonSerializer.Deserialize<OfflineImportResult>(json, Protocol.Json);
+
+        Assert.NotNull(result);
+        Assert.Equal("offline", result!.Source);
+        Assert.Equal("wechat-memory-json-v1", result.Schema);
+        Assert.Equal(2, result.ConversationCount);
+        Assert.Equal(3, result.MessageCount);
+    }
 
     [Fact]
     public void DatesIncludeTheEndDayAndIgnoreMachineZone()

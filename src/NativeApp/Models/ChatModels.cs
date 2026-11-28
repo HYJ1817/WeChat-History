@@ -73,6 +73,12 @@ public sealed record ConnectResult(
     bool ImageKeyAvailable,
     bool VoiceAvailable);
 
+public sealed record OfflineImportResult(
+    string Source,
+    string Schema,
+    int ConversationCount,
+    int MessageCount);
+
 public sealed record SceneItem(
     string Id,
     string Name,
@@ -97,35 +103,263 @@ public sealed record SceneItem(
 public sealed record SceneList(List<SceneItem> Items, List<string>? Warnings = null);
 
 public sealed record JobSummary(
-    string JobId,
-    string Status,
-    string CreatedAt,
-    string ConversationName,
-    int MessageCount,
+    string JobId = "",
+    string Status = "",
+    string? CreatedAt = null,
+    string? ConversationName = null,
+    int? MessageCount = null,
     string? SceneName = null,
     string? Target = null,
     string? Destination = null,
     string? Directory = null,
-    string? Error = null)
+    string? Error = null,
+    string? UpdatedAt = null,
+    string? ConversationId = null,
+    string? Detail = null,
+    int? Attempts = null,
+    bool? Retryable = null,
+    List<JobArtifact>? Artifacts = null)
 {
     public string StatusLabel => Status switch
     {
         "ready" => "待投递",
         "delivered" => "已投递",
         "copied" => "已复制",
+        "expired" => "已过期",
         "failed" => "失败",
         "running" => "执行中",
         "pending" => "等待中",
-        _ => Status,
+        _ => string.IsNullOrWhiteSpace(Status) ? "未知状态" : Status,
     };
-    public string Summary => $"{ConversationName} · {MessageCount} 条 · {StatusLabel}";
+    public string Summary => $"{(string.IsNullOrWhiteSpace(ConversationName) ? "会话未知" : ConversationName)} · {(MessageCount is >= 0 ? $"{MessageCount} 条" : "消息数未知")} · {StatusLabel}";
     public bool CanRedeliver => Status is "ready" or "failed";
-    public string TimeLabel => DateTimeOffset.TryParse(CreatedAt, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var value)
-        ? value.ToOffset(TimeSpan.FromHours(8)).ToString("MM-dd HH:mm", CultureInfo.InvariantCulture) : CreatedAt;
+    public string TimeLabel => FormatTime(CreatedAt, "创建时间未知", "MM-dd HH:mm");
+    public string CreatedAtDetailLabel => FormatTime(CreatedAt, "创建时间未提供", "yyyy-MM-dd HH:mm:ss");
+    public string UpdatedTimeLabel => FormatTime(UpdatedAt, "更新时间未知", "yyyy-MM-dd HH:mm");
+    public string UpdatedAtDetailLabel => FormatTime(UpdatedAt, "更新时间未提供", "yyyy-MM-dd HH:mm:ss");
+
+    private static string FormatTime(string? text, string missing, string format) =>
+        string.IsNullOrWhiteSpace(text) ? missing :
+        DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var value)
+            ? value.ToOffset(TimeSpan.FromHours(8)).ToString(format, CultureInfo.InvariantCulture)
+            : (text.Length <= 80 ? text : "时间格式未知");
 }
 
+public sealed record JobArtifact(string Name, string? Kind = null, long? Size = null, string? Sha256 = null);
+
 public sealed record JobList(List<JobSummary> Items, List<string>? Warnings = null);
-public sealed record JobDetail(JobSummary Job, string? Prompt = null);
+
+/// <summary>Safe, optional-field view of the existing get_job response.</summary>
+public sealed record JobDetail(
+    JobSummary Job,
+    string? SourceLabel = null,
+    string? Start = null,
+    string? End = null,
+    string? Query = null)
+{
+    public static JobDetail Parse(JsonElement response)
+    {
+        if (response.ValueKind != JsonValueKind.Object)
+            throw new WorkerException("PROTOCOL_ERROR", "任务详情格式不正确。");
+
+        JsonElement summary = Object(response, "job") ?? response;
+        JsonElement state = Object(response, "state") ?? default;
+        JsonElement manifest = Object(response, "manifest") ?? default;
+        JsonElement source = Object(manifest, "source") ?? default;
+        JsonElement window = Object(manifest, "window") ?? default;
+
+        string? Text(string name) => ReadText(summary, name) ?? ReadText(response, name);
+        int? Count(string name) => ReadCount(summary, name) ?? ReadCount(response, name);
+        string? stateText(string name) => ReadText(state, name);
+        int? stateCount(string name) => ReadCount(state, name);
+
+        var job = new JobSummary(
+            JobId: Text("jobId") ?? "",
+            Status: Text("status") ?? stateText("status") ?? "",
+            CreatedAt: Text("createdAt"),
+            ConversationName: Text("conversationName") ?? ReadText(Object(manifest, "conversation") ?? default, "name"),
+            MessageCount: Count("messageCount"),
+            SceneName: Text("sceneName") ?? ReadText(Object(manifest, "scene") ?? default, "name"),
+            Target: Text("target") ?? stateText("target"),
+            Destination: Text("destination") ?? stateText("destination"),
+            Directory: Text("directory"),
+            Error: Text("error") ?? stateText("error"),
+            UpdatedAt: Text("updatedAt") ?? stateText("updatedAt"),
+            ConversationId: Text("conversationId") ?? ReadText(Object(manifest, "conversation") ?? default, "id"),
+            Detail: Text("detail") ?? stateText("detail"),
+            Attempts: Count("attempts") ?? stateCount("attempts"),
+            Retryable: ReadBoolean(summary, "retryable") ?? ReadBoolean(state, "retryable") ?? ReadBoolean(response, "retryable"),
+            Artifacts: ReadArtifacts(summary, response));
+
+        if (string.IsNullOrWhiteSpace(job.JobId))
+            throw new WorkerException("PROTOCOL_ERROR", "任务详情缺少有效的任务标识。");
+
+        return new JobDetail(
+            job,
+            ReadText(source, "label"),
+            ReadText(window, "start"),
+            ReadText(window, "end"),
+            ReadText(window, "query"));
+    }
+
+    private static JsonElement? Object(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Object
+            ? value : null;
+
+    private static string? ReadText(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() : null;
+
+    private static int? ReadCount(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value) &&
+        value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out int count) && count >= 0
+            ? count : null;
+
+    private static bool? ReadBoolean(JsonElement element, string name)
+    {
+        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(name, out var value))
+            return null;
+        return value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => null,
+        };
+    }
+
+    private static List<JobArtifact>? ReadArtifacts(JsonElement summary, JsonElement response)
+    {
+        JsonElement owner = summary.ValueKind == JsonValueKind.Object && summary.TryGetProperty("artifacts", out _)
+            ? summary : response;
+        if (owner.ValueKind != JsonValueKind.Object || !owner.TryGetProperty("artifacts", out var items) || items.ValueKind != JsonValueKind.Array)
+            return null;
+
+        var result = new List<JobArtifact>();
+        foreach (var item in items.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object || !item.TryGetProperty("name", out var name) || name.ValueKind != JsonValueKind.String)
+                return null;
+            string? artifactName = name.GetString();
+            if (string.IsNullOrWhiteSpace(artifactName)) return null;
+            string? kind = ReadText(item, "kind");
+            long? size = item.TryGetProperty("size", out var sizeElement) && sizeElement.ValueKind == JsonValueKind.Number &&
+                sizeElement.TryGetInt64(out long bytes) && bytes >= 0 ? bytes : null;
+            result.Add(new JobArtifact(artifactName, kind, size, ReadText(item, "sha256")));
+        }
+        return result;
+    }
+}
+
+public sealed record PrunePreview(
+    int Days,
+    string Cutoff,
+    int CandidateCount,
+    long KnownArtifactBytes,
+    int UnknownSizeCount,
+    Dictionary<string, int> SkippedReasonCounts,
+    string PreviewToken)
+{
+    public bool HasCandidates => CandidateCount > 0;
+
+    public static PrunePreview Parse(JsonElement response)
+    {
+        if (response.ValueKind != JsonValueKind.Object || !ReadBoolean(response, "dryRun", expected: true) ||
+            !ReadInt(response, "days", out int days) || days < 1 ||
+            !ReadText(response, "cutoff", out string cutoff) ||
+            !ReadInt(response, "candidateCount", out int candidates) || candidates < 0 ||
+            !ReadLong(response, "knownArtifactBytes", out long bytes) || bytes < 0 ||
+            !ReadInt(response, "unknownSizeCount", out int unknown) || unknown < 0 ||
+            !ReadText(response, "previewToken", out string token))
+            throw new WorkerException("PROTOCOL_ERROR", "清理预览结果格式不正确。");
+        return new PrunePreview(days, cutoff, candidates, bytes, unknown,
+            ReadReasonCounts(response), token);
+    }
+
+    public static string FormatReasonCounts(IReadOnlyDictionary<string, int> counts)
+    {
+        static string Label(string reason) => reason switch
+        {
+            "unfinished" => "未完成或可恢复",
+            "not_old" => "未满足保留期限",
+            "recent_write" => "近期仍有写入",
+            "changed" => "检测到预览后变化",
+            "duplicate_id" => "任务标识重复",
+            "unsafe_path" => "路径受保护",
+            "unreadable" => "无法安全读取",
+            "unreadable_metadata" => "元数据不可读",
+            "unsupported_schema" => "格式不受支持",
+            "not_found" => "任务已不存在",
+            "in_use" => "文件正在使用中",
+            "protection_failed" => "无法建立安全删除保护",
+            "safe_delete_unavailable" => "当前卷不支持安全删除（仅支持 Windows 本地固定 NTFS）",
+            "delete_failed" => "删除过程中失败（可能已删除部分文件）",
+            "other" => "其他原因",
+            "unknown" => "原因未知",
+            _ => $"其他保护原因（{reason}）",
+        };
+        return string.Join("、", counts.Where(item => item.Value > 0)
+            .OrderBy(item => item.Key, StringComparer.Ordinal)
+            .Select(item => $"{Label(item.Key)} {item.Value:N0} 项"));
+    }
+
+    internal static Dictionary<string, int> ReadReasonCounts(JsonElement response)
+    {
+        var result = new Dictionary<string, int>(StringComparer.Ordinal);
+        if (response.ValueKind != JsonValueKind.Object || !response.TryGetProperty("skippedReasonCounts", out var counts) || counts.ValueKind != JsonValueKind.Object)
+            return result;
+        foreach (var property in counts.EnumerateObject())
+            if (property.Value.ValueKind == JsonValueKind.Number && property.Value.TryGetInt32(out int count) && count >= 0)
+                result[property.Name] = count;
+        return result;
+    }
+
+    internal static bool ReadInt(JsonElement element, string name, out int result)
+    {
+        result = 0;
+        return element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value) &&
+            value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out result);
+    }
+
+    internal static bool ReadLong(JsonElement element, string name, out long result)
+    {
+        result = 0;
+        return element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value) &&
+            value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out result);
+    }
+
+    internal static bool ReadText(JsonElement element, string name, out string result)
+    {
+        result = "";
+        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.String)
+            return false;
+        result = value.GetString() ?? "";
+        return !string.IsNullOrWhiteSpace(result);
+    }
+
+    internal static bool ReadBoolean(JsonElement element, string name, bool expected) =>
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value) &&
+        (expected ? value.ValueKind == JsonValueKind.True : value.ValueKind == JsonValueKind.False);
+}
+
+public sealed record PruneResult(
+    int Days,
+    string Cutoff,
+    int RemovedCount,
+    int SkippedCount,
+    Dictionary<string, int> SkippedReasonCounts)
+{
+    public static PruneResult Parse(JsonElement response)
+    {
+        if (response.ValueKind != JsonValueKind.Object || !PrunePreview.ReadBoolean(response, "dryRun", expected: false) ||
+            !PrunePreview.ReadInt(response, "days", out int days) || days < 1 ||
+            !PrunePreview.ReadText(response, "cutoff", out string cutoff) ||
+            !PrunePreview.ReadInt(response, "removedCount", out int removed) || removed < 0 ||
+            !PrunePreview.ReadInt(response, "skippedCount", out int skipped) || skipped < 0)
+            throw new WorkerException("PROTOCOL_ERROR", "清理执行结果格式不正确。");
+        return new PruneResult(days, cutoff, removed, skipped, PrunePreview.ReadReasonCounts(response));
+    }
+}
+
 public sealed record ArtifactPath(string Path);
 public sealed record VoiceStatus(string Model, bool Installed, bool ComponentAvailable, bool RequiresDownload, bool ConnectedVoice)
 {

@@ -40,6 +40,11 @@ class FontBook:
         return ImageFont.truetype(str(self.emoji_path), size=size)
 
 
+def single_line_metadata(text: str) -> str:
+    """Flatten metadata only at the drawing boundary, not in stored models."""
+    return text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+
+
 def text_length_with_fallback(
     draw: ImageDraw.ImageDraw,
     text: str,
